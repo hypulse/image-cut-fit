@@ -20,6 +20,17 @@ class CroppedImageResult:
         return image_to_png_bytes(self.cropped)
 
 
+@dataclass(frozen=True)
+class SpriteComponent:
+    image: Image.Image
+    bbox: tuple[int, int, int, int]
+    area: int
+
+    @property
+    def png_bytes(self) -> bytes:
+        return image_to_png_bytes(self.image)
+
+
 def image_to_png_bytes(image: Image.Image) -> bytes:
     buffer = BytesIO()
     image.save(buffer, format="PNG")
@@ -81,6 +92,51 @@ def crop_to_alpha_bbox(
 ) -> tuple[Image.Image, tuple[int, int, int, int]]:
     bbox = alpha_bbox(image, alpha_threshold=alpha_threshold)
     return image.crop(bbox), bbox
+
+
+def extract_connected_components(
+    image: Image.Image,
+    *,
+    alpha_threshold: int = 16,
+    min_area: int = 64,
+) -> list[SpriteComponent]:
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+
+    try:
+        from scipy import ndimage
+    except ImportError as exc:
+        raise RuntimeError(
+            "스프라이트 분리에는 scipy가 필요합니다. `pip install -r requirements.txt`를 실행하세요."
+        ) from exc
+
+    alpha = np.array(image.getchannel("A"))
+    foreground = alpha > alpha_threshold
+    structure = np.ones((3, 3), dtype=np.uint8)
+    labels, component_count = ndimage.label(foreground, structure=structure)
+    slices = ndimage.find_objects(labels)
+
+    components: list[SpriteComponent] = []
+    for label_index, component_slice in enumerate(slices, start=1):
+        if component_slice is None:
+            continue
+
+        y_slice, x_slice = component_slice
+        component_mask = labels[component_slice] == label_index
+        area = int(component_mask.sum())
+        if area < min_area:
+            continue
+
+        bbox = (x_slice.start, y_slice.start, x_slice.stop, y_slice.stop)
+        components.append(
+            SpriteComponent(
+                image=image.crop(bbox),
+                bbox=bbox,
+                area=area,
+            )
+        )
+
+    return sorted(components, key=lambda component: (component.bbox[1], component.bbox[0]))
 
 
 def resize_to_target(
@@ -169,4 +225,32 @@ def remove_background_and_crop(
         removed_background=removed,
         source_size=source.size,
         bbox=bbox,
+    )
+
+
+def remove_background_and_extract_sprites(
+    image_bytes: bytes,
+    *,
+    alpha_threshold: int = 16,
+    min_area: int = 64,
+    preserve_interior: bool = True,
+    post_process_mask: bool = False,
+    session: Any | None = None,
+) -> list[SpriteComponent]:
+    source = load_image(image_bytes)
+    removed = remove_background(
+        source,
+        session=session,
+        post_process_mask=post_process_mask,
+    )
+    if preserve_interior:
+        removed = restore_enclosed_transparency(
+            source,
+            removed,
+            alpha_threshold=alpha_threshold,
+        )
+    return extract_connected_components(
+        removed,
+        alpha_threshold=alpha_threshold,
+        min_area=min_area,
     )
