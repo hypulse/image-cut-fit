@@ -1,0 +1,172 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from io import BytesIO
+from typing import Any
+
+import numpy as np
+from PIL import Image, ImageOps
+
+
+@dataclass(frozen=True)
+class CroppedImageResult:
+    cropped: Image.Image
+    removed_background: Image.Image
+    source_size: tuple[int, int]
+    bbox: tuple[int, int, int, int]
+
+    @property
+    def png_bytes(self) -> bytes:
+        return image_to_png_bytes(self.cropped)
+
+
+def image_to_png_bytes(image: Image.Image) -> bytes:
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def load_image(image_bytes: bytes) -> Image.Image:
+    image = Image.open(BytesIO(image_bytes))
+    image = ImageOps.exif_transpose(image)
+    return image.convert("RGBA")
+
+
+def remove_background(
+    image: Image.Image,
+    session: Any | None = None,
+    *,
+    post_process_mask: bool = False,
+) -> Image.Image:
+    try:
+        from rembg import remove
+    except ImportError as exc:
+        raise RuntimeError(
+            "rembg가 설치되어 있지 않습니다. `pip install -r requirements.txt`를 실행하세요."
+        ) from exc
+
+    kwargs = {
+        "post_process_mask": post_process_mask,
+    }
+    if session is not None:
+        kwargs["session"] = session
+    result = remove(image, **kwargs)
+
+    if isinstance(result, Image.Image):
+        return result.convert("RGBA")
+
+    if isinstance(result, bytes):
+        return Image.open(BytesIO(result)).convert("RGBA")
+
+    raise TypeError(f"지원하지 않는 rembg 결과 타입입니다: {type(result)!r}")
+
+
+def alpha_bbox(image: Image.Image, alpha_threshold: int = 0) -> tuple[int, int, int, int]:
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+
+    alpha = image.getchannel("A")
+    if alpha_threshold > 0:
+        alpha = alpha.point(lambda value: 255 if value > alpha_threshold else 0)
+
+    bbox = alpha.getbbox()
+    if bbox is None:
+        raise ValueError("투명하지 않은 픽셀을 찾지 못했습니다.")
+    return bbox
+
+
+def crop_to_alpha_bbox(
+    image: Image.Image,
+    alpha_threshold: int = 0,
+) -> tuple[Image.Image, tuple[int, int, int, int]]:
+    bbox = alpha_bbox(image, alpha_threshold=alpha_threshold)
+    return image.crop(bbox), bbox
+
+
+def resize_to_target(
+    image: Image.Image,
+    *,
+    width: int,
+    height: int,
+    mode: str,
+) -> Image.Image:
+    if width < 1 or height < 1:
+        raise ValueError("출력 가로/세로는 1px 이상이어야 합니다.")
+
+    image = image.convert("RGBA")
+    target_size = (int(width), int(height))
+
+    if mode == "stretch":
+        return image.resize(target_size, Image.Resampling.LANCZOS)
+
+    if mode == "contain_center":
+        fitted = ImageOps.contain(image, target_size, Image.Resampling.LANCZOS)
+        canvas = Image.new("RGBA", target_size, (0, 0, 0, 0))
+        offset = ((width - fitted.width) // 2, (height - fitted.height) // 2)
+        canvas.alpha_composite(fitted, dest=offset)
+        return canvas
+
+    raise ValueError(f"지원하지 않는 리사이즈 모드입니다: {mode}")
+
+
+def restore_enclosed_transparency(
+    source: Image.Image,
+    removed_background: Image.Image,
+    *,
+    alpha_threshold: int = 16,
+) -> Image.Image:
+    if source.size != removed_background.size:
+        raise ValueError("원본 이미지와 배경 제거 이미지의 크기가 다릅니다.")
+
+    try:
+        from scipy import ndimage
+    except ImportError as exc:
+        raise RuntimeError(
+            "객체 내부 복원에는 scipy가 필요합니다. `pip install -r requirements.txt`를 실행하세요."
+        ) from exc
+
+    source_rgba = source.convert("RGBA")
+    removed_rgba = removed_background.convert("RGBA")
+
+    alpha = np.array(removed_rgba.getchannel("A"))
+    foreground = alpha > alpha_threshold
+    filled_foreground = ndimage.binary_fill_holes(foreground)
+    enclosed_holes = filled_foreground & ~foreground
+
+    if not enclosed_holes.any():
+        return removed_rgba
+
+    restored = np.array(removed_rgba)
+    source_pixels = np.array(source_rgba)
+    restored[enclosed_holes, :3] = source_pixels[enclosed_holes, :3]
+    restored[enclosed_holes, 3] = 255
+    return Image.fromarray(restored, mode="RGBA")
+
+
+def remove_background_and_crop(
+    image_bytes: bytes,
+    *,
+    alpha_threshold: int = 0,
+    preserve_interior: bool = True,
+    post_process_mask: bool = False,
+    session: Any | None = None,
+) -> CroppedImageResult:
+    source = load_image(image_bytes)
+    removed = remove_background(
+        source,
+        session=session,
+        post_process_mask=post_process_mask,
+    )
+    if preserve_interior:
+        removed = restore_enclosed_transparency(
+            source,
+            removed,
+            alpha_threshold=alpha_threshold,
+        )
+    cropped, bbox = crop_to_alpha_bbox(removed, alpha_threshold=alpha_threshold)
+    return CroppedImageResult(
+        cropped=cropped,
+        removed_background=removed,
+        source_size=source.size,
+        bbox=bbox,
+    )
