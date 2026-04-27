@@ -10,6 +10,7 @@ import streamlit as st
 from PIL import Image
 
 from image_pipeline import (
+    apply_padding_and_background,
     crop_to_alpha_bbox,
     image_to_png_bytes,
     load_image,
@@ -39,7 +40,7 @@ def safe_stem(original_name: str) -> str:
 
 
 def safe_output_name(original_name: str, width: int, height: int) -> str:
-    return f"{safe_stem(original_name)}_transparent_{width}x{height}.png"
+    return f"{safe_stem(original_name)}_output_{width}x{height}.png"
 
 
 def unique_output_path(path: Path) -> Path:
@@ -156,17 +157,27 @@ def build_output_image(
     width: int,
     height: int,
     resize_mode: str,
+    padding: int,
+    transparent_background: bool,
+    background_color: str,
 ):
     cropped = Image.open(BytesIO(cropped_png_bytes)).convert("RGBA")
-    output = resize_to_target(
+    resized = resize_to_target(
         cropped,
         width=width,
         height=height,
         mode=resize_mode,
     )
+    output = apply_padding_and_background(
+        resized,
+        padding=padding,
+        transparent_background=transparent_background,
+        background_color=background_color,
+    )
     return {
         "png_bytes": image_to_png_bytes(output),
         "preview_bytes": checkerboard_preview(output),
+        "resized_size": resized.size,
         "size": output.size,
     }
 
@@ -185,6 +196,9 @@ def initialize_image_state(image_id: str) -> None:
         "output_width": 0,
         "output_height": 0,
         "resize_mode": "contain_center",
+        "padding": 0,
+        "transparent_background": True,
+        "background_color": "#000000",
     }
 
     for name, value in defaults.items():
@@ -223,6 +237,13 @@ def image_settings(image_id: str) -> dict[str, Any]:
         ),
         "resize_mode": st.session_state[image_state_key(image_id, "resize_mode")]
         or "contain_center",
+        "padding": int(st.session_state[image_state_key(image_id, "padding")]),
+        "transparent_background": bool(
+            st.session_state[image_state_key(image_id, "transparent_background")]
+        ),
+        "background_color": st.session_state[
+            image_state_key(image_id, "background_color")
+        ],
     }
 
 
@@ -281,6 +302,9 @@ def render_compact_controls(
     height_key = image_state_key(image_id, "output_height")
     lock_key = image_state_key(image_id, "aspect_locked")
     resize_key = image_state_key(image_id, "resize_mode")
+    padding_key = image_state_key(image_id, "padding")
+    transparent_key = image_state_key(image_id, "transparent_background")
+    background_key = image_state_key(image_id, "background_color")
 
     st.caption("옵션")
     if show_background_controls:
@@ -382,6 +406,29 @@ def render_compact_controls(
         if resize_mode is None:
             st.session_state[resize_key] = "contain_center"
 
+    background_option_cols = st.columns([1, 1, 1], vertical_alignment="bottom")
+    with background_option_cols[0]:
+        st.number_input(
+            "Padding",
+            min_value=0,
+            max_value=MAX_OUTPUT_SIZE,
+            step=1,
+            key=padding_key,
+            help="현재 Output 이미지 바깥쪽에 추가할 여백(px)입니다.",
+        )
+    with background_option_cols[1]:
+        st.checkbox(
+            "투명 배경",
+            key=transparent_key,
+            help="끄면 지정한 배경색으로 투명 영역과 padding을 채웁니다.",
+        )
+    with background_option_cols[2]:
+        st.color_picker(
+            "배경색",
+            key=background_key,
+            disabled=bool(st.session_state[transparent_key]),
+        )
+
 
 def process_item_output(item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], int, int]:
     settings = image_settings(item["id"])
@@ -408,6 +455,9 @@ def process_item_output(item: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
         target_width,
         target_height,
         resize_mode,
+        settings["padding"],
+        settings["transparent_background"],
+        settings["background_color"],
     )
     return crop, output, target_width, target_height
 
@@ -471,7 +521,10 @@ def render_image_card(item: dict[str, Any]) -> None:
             f"source={source_width}x{source_height}px · "
             f"bbox=({x0}, {y0}, {x1}, {y1}) · "
             f"cropped={cropped_width}x{cropped_height}px · "
-            f"output={target_width}x{target_height}px · "
+            f"resized={target_width}x{target_height}px · "
+            f"final={output['size'][0]}x{output['size'][1]}px · "
+            f"padding={settings['padding']}px · "
+            f"background={'transparent' if settings['transparent_background'] else settings['background_color']} · "
             f"mode={RESIZE_MODE_OPTIONS[settings['resize_mode']]} · "
             f"removed={trimmed_width}px width, {trimmed_height}px height"
         )
@@ -483,7 +536,8 @@ def render_image_card(item: dict[str, Any]) -> None:
         )
 
         action_cols = st.columns([1, 1, 2], vertical_alignment="bottom")
-        output_name = safe_output_name(item["name"], target_width, target_height)
+        final_width, final_height = output["size"]
+        output_name = safe_output_name(item["name"], final_width, final_height)
         with action_cols[0]:
             st.download_button(
                 "PNG 다운로드",
@@ -502,15 +556,15 @@ def render_image_card(item: dict[str, Any]) -> None:
                 output_path = save_output(
                     item,
                     output["png_bytes"],
-                    target_width,
-                    target_height,
+                    final_width,
+                    final_height,
                 )
                 st.success(f"저장됨: {output_path}")
 
 
-st.set_page_config(page_title="Background Cropper", layout="wide")
+st.set_page_config(page_title="Image Cut Fit", layout="wide")
 
-st.title("Background Cropper")
+st.title("Image Cut Fit")
 
 uploaded_files = st.file_uploader(
     "이미지 업로드",
@@ -647,12 +701,13 @@ if st.button("모든 이미지 저장", type="primary", use_container_width=True
         )
         try:
             _, item_output, item_width, item_height = process_item_output(item)
+            final_width, final_height = item_output["size"]
             saved_paths.append(
                 save_output(
                     item,
                     item_output["png_bytes"],
-                    item_width,
-                    item_height,
+                    final_width,
+                    final_height,
                 )
             )
         except Exception as exc:

@@ -5,7 +5,7 @@ from io import BytesIO
 from typing import Any
 
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageColor, ImageOps
 
 
 @dataclass(frozen=True)
@@ -163,6 +163,31 @@ def resize_to_target(
         return canvas
 
     raise ValueError(f"지원하지 않는 리사이즈 모드입니다: {mode}")
+
+
+def apply_padding_and_background(
+    image: Image.Image,
+    *,
+    padding: int = 0,
+    transparent_background: bool = True,
+    background_color: str = "#000000",
+) -> Image.Image:
+    if padding < 0:
+        raise ValueError("padding은 0px 이상이어야 합니다.")
+
+    image = image.convert("RGBA")
+    width, height = image.size
+    canvas_size = (width + padding * 2, height + padding * 2)
+
+    if transparent_background:
+        fill = (0, 0, 0, 0)
+    else:
+        red, green, blue = ImageColor.getrgb(background_color)
+        fill = (red, green, blue, 255)
+
+    canvas = Image.new("RGBA", canvas_size, fill)
+    canvas.alpha_composite(image, dest=(padding, padding))
+    return canvas
 
 
 def restore_enclosed_transparency(
