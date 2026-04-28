@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import html
 import re
 from io import BytesIO
 from pathlib import Path
@@ -37,6 +39,8 @@ RESIZE_MODE_OPTIONS = {
 }
 MAX_OUTPUT_SIZE = 8192
 PREVIEW_MAX_WIDTH = 520
+PREVIEW_FRAME_HEIGHT = 240
+PREVIEW_RENDER_SCALE = 2
 MIN_ROTATION_DEGREES = -180
 MAX_ROTATION_DEGREES = 180
 
@@ -62,8 +66,20 @@ def unique_output_path(path: Path) -> Path:
     raise RuntimeError(f"저장 가능한 파일명을 만들지 못했습니다: {path.name}")
 
 
+def shrink_for_preview(image: Image.Image) -> Image.Image:
+    preview = image.copy().convert("RGBA")
+    preview.thumbnail(
+        (
+            PREVIEW_MAX_WIDTH * PREVIEW_RENDER_SCALE,
+            PREVIEW_FRAME_HEIGHT * PREVIEW_RENDER_SCALE,
+        ),
+        Image.Resampling.LANCZOS,
+    )
+    return preview
+
+
 def checkerboard_preview(image: Image.Image, square_size: int = 16) -> bytes:
-    image = image.convert("RGBA")
+    image = shrink_for_preview(image)
     width, height = image.size
     background = Image.new("RGBA", image.size, (255, 255, 255, 255))
 
@@ -84,11 +100,67 @@ def checkerboard_preview(image: Image.Image, square_size: int = 16) -> bytes:
     return buffer.getvalue()
 
 
+def png_data_uri(image_bytes: bytes) -> str:
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def render_fixed_preview(image_bytes: bytes, *, alt: str) -> None:
+    safe_alt = html.escape(alt, quote=True)
+    st.markdown(
+        f"""
+        <div class="fixed-preview-frame">
+            <img src="{png_data_uri(image_bytes)}" alt="{safe_alt}">
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_preview_styles() -> None:
+    st.markdown(
+        f"""
+        <style>
+        .fixed-preview-frame {{
+            height: {PREVIEW_FRAME_HEIGHT}px;
+            width: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            border: 1px solid rgba(49, 51, 63, 0.16);
+            border-radius: 6px;
+            background: rgb(250, 250, 250);
+        }}
+
+        .fixed-preview-frame img {{
+            display: block;
+            width: auto;
+            height: auto;
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 @st.cache_resource(show_spinner=False)
 def get_rembg_session(model_name: str):
     from rembg import new_session
 
     return new_session(model_name)
+
+
+@st.cache_data(show_spinner=False)
+def process_original_preview(image_bytes: bytes):
+    source = load_image(image_bytes)
+    return {
+        "preview_bytes": checkerboard_preview(source),
+        "size": source.size,
+    }
 
 
 @st.cache_data(show_spinner=False)
@@ -212,6 +284,12 @@ def image_state_key(image_id: str, name: str) -> str:
     return f"image_{image_id}_{name}"
 
 
+def normalize_resize_mode(value: Any) -> str:
+    if value in RESIZE_MODE_OPTIONS:
+        return str(value)
+    return "contain_center"
+
+
 def initialize_image_state(image_id: str) -> None:
     defaults: dict[str, Any] = {
         "model_name": "u2net",
@@ -265,8 +343,9 @@ def image_settings(image_id: str) -> dict[str, Any]:
         "rotation_degrees": int(
             st.session_state[image_state_key(image_id, "rotation_degrees")]
         ),
-        "resize_mode": st.session_state[image_state_key(image_id, "resize_mode")]
-        or "contain_center",
+        "resize_mode": normalize_resize_mode(
+            st.session_state[image_state_key(image_id, "resize_mode")]
+        ),
         "padding": int(st.session_state[image_state_key(image_id, "padding")]),
         "transparent_background": bool(
             st.session_state[image_state_key(image_id, "transparent_background")]
@@ -426,7 +505,10 @@ def render_compact_controls(
             )
 
     with size_cols[3]:
-        resize_mode = st.segmented_control(
+        st.session_state[resize_key] = normalize_resize_mode(
+            st.session_state.get(resize_key)
+        )
+        st.segmented_control(
             "리사이즈",
             options=list(RESIZE_MODE_OPTIONS.keys()),
             format_func=lambda value: RESIZE_MODE_OPTIONS[value],
@@ -434,8 +516,6 @@ def render_compact_controls(
             help="비율 유지 옵션은 투명 캔버스 안에 맞춘 뒤 중앙/상단/하단/좌측/우측으로 배치합니다. 늘려서 채우기는 비율을 무시합니다.",
             width="stretch",
         )
-        if resize_mode is None:
-            st.session_state[resize_key] = "contain_center"
 
     background_option_cols = st.columns([1.4, 1, 1, 1], vertical_alignment="bottom")
     with background_option_cols[0]:
@@ -537,7 +617,12 @@ def render_image_card(item: dict[str, Any]) -> None:
             ensure_output_size(item["id"], (1, 1))
             preview_col, controls_col = st.columns([1, 2], vertical_alignment="top")
             with preview_col:
-                st.image(item["bytes"], use_container_width=True)
+                st.caption("Original")
+                original_preview = process_original_preview(item["bytes"])
+                render_fixed_preview(
+                    original_preview["preview_bytes"],
+                    alt=f"{item['name']} original",
+                )
             with controls_col:
                 render_compact_controls(
                     item["id"],
@@ -548,22 +633,32 @@ def render_image_card(item: dict[str, Any]) -> None:
             return
 
         settings = image_settings(item["id"])
+        original_preview = process_original_preview(item["bytes"])
         preview_cols = st.columns(4, vertical_alignment="top")
         with preview_cols[0]:
             st.caption("Original")
-            st.image(item["bytes"], use_container_width=True)
+            render_fixed_preview(
+                original_preview["preview_bytes"],
+                alt=f"{item['name']} original",
+            )
         with preview_cols[1]:
             st.caption("Cropped")
-            preview_width = min(crop["cropped_size"][0], PREVIEW_MAX_WIDTH)
-            st.image(crop["preview_bytes"], width=preview_width)
+            render_fixed_preview(
+                crop["preview_bytes"],
+                alt=f"{item['name']} cropped",
+            )
         with preview_cols[2]:
             st.caption("Rotated")
-            rotated_preview_width = min(rotated["size"][0], PREVIEW_MAX_WIDTH)
-            st.image(rotated["preview_bytes"], width=rotated_preview_width)
+            render_fixed_preview(
+                rotated["preview_bytes"],
+                alt=f"{item['name']} rotated",
+            )
         with preview_cols[3]:
             st.caption("Output")
-            output_preview_width = min(output["size"][0], PREVIEW_MAX_WIDTH)
-            st.image(output["preview_bytes"], width=output_preview_width)
+            render_fixed_preview(
+                output["preview_bytes"],
+                alt=f"{item['name']} output",
+            )
 
         x0, y0, x1, y1 = crop["bbox"]
         cropped_width, cropped_height = crop["cropped_size"]
@@ -618,6 +713,7 @@ def render_image_card(item: dict[str, Any]) -> None:
 
 
 st.set_page_config(page_title="Image Cut Fit", layout="wide")
+render_preview_styles()
 
 st.title("Image Cut Fit")
 
