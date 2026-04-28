@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Any
@@ -92,6 +93,31 @@ def crop_to_alpha_bbox(
 ) -> tuple[Image.Image, tuple[int, int, int, int]]:
     bbox = alpha_bbox(image, alpha_threshold=alpha_threshold)
     return image.crop(bbox), bbox
+
+
+def rotate_image(
+    image: Image.Image,
+    *,
+    degrees: float = 0,
+    alpha_threshold: int = 0,
+) -> Image.Image:
+    image = image.convert("RGBA")
+    degrees = float(degrees)
+    if math.isclose(degrees % 360, 0, abs_tol=1e-9):
+        return image
+
+    rotated = image.rotate(
+        -degrees,
+        expand=True,
+        resample=Image.Resampling.BICUBIC,
+        fillcolor=(0, 0, 0, 0),
+    )
+
+    try:
+        cropped, _ = crop_to_alpha_bbox(rotated, alpha_threshold=alpha_threshold)
+        return cropped
+    except ValueError:
+        return rotated
 
 
 def extract_connected_components(

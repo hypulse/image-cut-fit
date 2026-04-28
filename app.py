@@ -16,6 +16,7 @@ from image_pipeline import (
     load_image,
     remove_background_and_crop,
     remove_background_and_extract_sprites,
+    rotate_image,
     resize_to_target,
 )
 
@@ -36,6 +37,8 @@ RESIZE_MODE_OPTIONS = {
 }
 MAX_OUTPUT_SIZE = 8192
 PREVIEW_MAX_WIDTH = 520
+MIN_ROTATION_DEGREES = -180
+MAX_ROTATION_DEGREES = 180
 
 
 def safe_stem(original_name: str) -> str:
@@ -128,6 +131,25 @@ def process_alpha_crop(image_bytes: bytes, alpha_threshold: int):
 
 
 @st.cache_data(show_spinner=False)
+def process_rotation(
+    cropped_png_bytes: bytes,
+    rotation_degrees: int,
+    alpha_threshold: int,
+):
+    cropped = Image.open(BytesIO(cropped_png_bytes)).convert("RGBA")
+    rotated = rotate_image(
+        cropped,
+        degrees=rotation_degrees,
+        alpha_threshold=alpha_threshold,
+    )
+    return {
+        "png_bytes": image_to_png_bytes(rotated),
+        "preview_bytes": checkerboard_preview(rotated),
+        "size": rotated.size,
+    }
+
+
+@st.cache_data(show_spinner=False)
 def process_sprite_sheet(
     image_bytes: bytes,
     alpha_threshold: int,
@@ -199,6 +221,7 @@ def initialize_image_state(image_id: str) -> None:
         "aspect_locked": True,
         "output_width": 0,
         "output_height": 0,
+        "rotation_degrees": 0,
         "resize_mode": "contain_center",
         "padding": 0,
         "transparent_background": True,
@@ -238,6 +261,9 @@ def image_settings(image_id: str) -> dict[str, Any]:
         "output_width": int(st.session_state[image_state_key(image_id, "output_width")]),
         "output_height": int(
             st.session_state[image_state_key(image_id, "output_height")]
+        ),
+        "rotation_degrees": int(
+            st.session_state[image_state_key(image_id, "rotation_degrees")]
         ),
         "resize_mode": st.session_state[image_state_key(image_id, "resize_mode")]
         or "contain_center",
@@ -305,6 +331,7 @@ def render_compact_controls(
     width_key = image_state_key(image_id, "output_width")
     height_key = image_state_key(image_id, "output_height")
     lock_key = image_state_key(image_id, "aspect_locked")
+    rotation_key = image_state_key(image_id, "rotation_degrees")
     resize_key = image_state_key(image_id, "resize_mode")
     padding_key = image_state_key(image_id, "padding")
     transparent_key = image_state_key(image_id, "transparent_background")
@@ -410,8 +437,17 @@ def render_compact_controls(
         if resize_mode is None:
             st.session_state[resize_key] = "contain_center"
 
-    background_option_cols = st.columns([1, 1, 1], vertical_alignment="bottom")
+    background_option_cols = st.columns([1.4, 1, 1, 1], vertical_alignment="bottom")
     with background_option_cols[0]:
+        st.slider(
+            "각도",
+            min_value=MIN_ROTATION_DEGREES,
+            max_value=MAX_ROTATION_DEGREES,
+            step=1,
+            key=rotation_key,
+            help="양수는 시계 방향, 음수는 반시계 방향으로 회전합니다.",
+        )
+    with background_option_cols[1]:
         st.number_input(
             "Padding",
             min_value=0,
@@ -420,13 +456,13 @@ def render_compact_controls(
             key=padding_key,
             help="현재 Output 이미지 바깥쪽에 추가할 여백(px)입니다.",
         )
-    with background_option_cols[1]:
+    with background_option_cols[2]:
         st.checkbox(
             "투명 배경",
             key=transparent_key,
             help="끄면 지정한 배경색으로 투명 영역과 padding을 채웁니다.",
         )
-    with background_option_cols[2]:
+    with background_option_cols[3]:
         st.color_picker(
             "배경색",
             key=background_key,
@@ -434,7 +470,9 @@ def render_compact_controls(
         )
 
 
-def process_item_output(item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], int, int]:
+def process_item_output(
+    item: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], int, int]:
     settings = image_settings(item["id"])
     if item.get("kind") == "sprite":
         crop = process_alpha_crop(
@@ -449,13 +487,18 @@ def process_item_output(item: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
             settings["preserve_interior"],
             settings["post_process_mask"],
         )
-    ensure_output_size(item["id"], crop["cropped_size"])
+    rotated = process_rotation(
+        crop["png_bytes"],
+        settings["rotation_degrees"],
+        settings["alpha_threshold"],
+    )
+    ensure_output_size(item["id"], rotated["size"])
     target_width, target_height, resize_mode = current_target_size(
         item["id"],
-        crop["cropped_size"],
+        rotated["size"],
     )
     output = build_output_image(
-        crop["png_bytes"],
+        rotated["png_bytes"],
         target_width,
         target_height,
         resize_mode,
@@ -463,7 +506,7 @@ def process_item_output(item: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
         settings["transparent_background"],
         settings["background_color"],
     )
-    return crop, output, target_width, target_height
+    return crop, rotated, output, target_width, target_height
 
 
 def save_output(item: dict[str, Any], png_bytes: bytes, width: int, height: int) -> Path:
@@ -487,7 +530,9 @@ def render_image_card(item: dict[str, Any]) -> None:
 
         try:
             with st.spinner(f"{item['name']} 처리 중..."):
-                crop, output, target_width, target_height = process_item_output(item)
+                crop, rotated, output, target_width, target_height = (
+                    process_item_output(item)
+                )
         except Exception as exc:
             ensure_output_size(item["id"], (1, 1))
             preview_col, controls_col = st.columns([1, 2], vertical_alignment="top")
@@ -503,7 +548,7 @@ def render_image_card(item: dict[str, Any]) -> None:
             return
 
         settings = image_settings(item["id"])
-        preview_cols = st.columns(3, vertical_alignment="top")
+        preview_cols = st.columns(4, vertical_alignment="top")
         with preview_cols[0]:
             st.caption("Original")
             st.image(item["bytes"], use_container_width=True)
@@ -512,6 +557,10 @@ def render_image_card(item: dict[str, Any]) -> None:
             preview_width = min(crop["cropped_size"][0], PREVIEW_MAX_WIDTH)
             st.image(crop["preview_bytes"], width=preview_width)
         with preview_cols[2]:
+            st.caption("Rotated")
+            rotated_preview_width = min(rotated["size"][0], PREVIEW_MAX_WIDTH)
+            st.image(rotated["preview_bytes"], width=rotated_preview_width)
+        with preview_cols[3]:
             st.caption("Output")
             output_preview_width = min(output["size"][0], PREVIEW_MAX_WIDTH)
             st.image(output["preview_bytes"], width=output_preview_width)
@@ -525,8 +574,10 @@ def render_image_card(item: dict[str, Any]) -> None:
             f"source={source_width}x{source_height}px · "
             f"bbox=({x0}, {y0}, {x1}, {y1}) · "
             f"cropped={cropped_width}x{cropped_height}px · "
+            f"rotated={rotated['size'][0]}x{rotated['size'][1]}px · "
             f"resized={target_width}x{target_height}px · "
             f"final={output['size'][0]}x{output['size'][1]}px · "
+            f"angle={settings['rotation_degrees']}deg · "
             f"padding={settings['padding']}px · "
             f"background={'transparent' if settings['transparent_background'] else settings['background_color']} · "
             f"mode={RESIZE_MODE_OPTIONS[settings['resize_mode']]} · "
@@ -535,7 +586,7 @@ def render_image_card(item: dict[str, Any]) -> None:
 
         render_compact_controls(
             item["id"],
-            crop["cropped_size"],
+            rotated["size"],
             show_background_controls=item.get("kind") != "sprite",
         )
 
@@ -704,7 +755,7 @@ if st.button("모든 이미지 저장", type="primary", use_container_width=True
             text=f"{item['name']} 처리 중...",
         )
         try:
-            _, item_output, item_width, item_height = process_item_output(item)
+            _, _, item_output, item_width, item_height = process_item_output(item)
             final_width, final_height = item_output["size"]
             saved_paths.append(
                 save_output(
