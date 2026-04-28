@@ -28,6 +28,10 @@ MODEL_OPTIONS = {
 }
 RESIZE_MODE_OPTIONS = {
     "contain_center": "비율 유지 중앙",
+    "contain_top": "비율 유지 상단",
+    "contain_bottom": "비율 유지 하단",
+    "contain_left": "비율 유지 좌측",
+    "contain_right": "비율 유지 우측",
     "stretch": "늘려서 채우기",
 }
 MAX_OUTPUT_SIZE = 8192
@@ -400,7 +404,7 @@ def render_compact_controls(
             options=list(RESIZE_MODE_OPTIONS.keys()),
             format_func=lambda value: RESIZE_MODE_OPTIONS[value],
             key=resize_key,
-            help="늘려서 채우기는 비율을 무시하고, 비율 유지 중앙은 투명 캔버스 중앙에 배치합니다.",
+            help="비율 유지 옵션은 투명 캔버스 안에 맞춘 뒤 중앙/상단/하단/좌측/우측으로 배치합니다. 늘려서 채우기는 비율을 무시합니다.",
             width="stretch",
         )
         if resize_mode is None:

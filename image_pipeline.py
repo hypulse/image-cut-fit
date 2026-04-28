@@ -155,10 +155,30 @@ def resize_to_target(
     if mode == "stretch":
         return image.resize(target_size, Image.Resampling.LANCZOS)
 
-    if mode == "contain_center":
+    contain_offsets = {
+        "contain_center": ("center", "center"),
+        "contain_top": ("center", "start"),
+        "contain_bottom": ("center", "end"),
+        "contain_left": ("start", "center"),
+        "contain_right": ("end", "center"),
+    }
+    if mode in contain_offsets:
         fitted = ImageOps.contain(image, target_size, Image.Resampling.LANCZOS)
         canvas = Image.new("RGBA", target_size, (0, 0, 0, 0))
-        offset = ((width - fitted.width) // 2, (height - fitted.height) // 2)
+        horizontal, vertical = contain_offsets[mode]
+        extra_width = target_size[0] - fitted.width
+        extra_height = target_size[1] - fitted.height
+        x_offset = {
+            "start": 0,
+            "center": extra_width // 2,
+            "end": extra_width,
+        }[horizontal]
+        y_offset = {
+            "start": 0,
+            "center": extra_height // 2,
+            "end": extra_height,
+        }[vertical]
+        offset = (x_offset, y_offset)
         canvas.alpha_composite(fitted, dest=offset)
         return canvas
 
