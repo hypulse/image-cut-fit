@@ -226,16 +226,30 @@ def resize_to_target(
 def apply_padding_and_background(
     image: Image.Image,
     *,
-    padding: int = 0,
+    padding: int | None = None,
+    padding_top: int = 0,
+    padding_right: int = 0,
+    padding_bottom: int = 0,
+    padding_left: int = 0,
     transparent_background: bool = True,
     background_color: str = "#000000",
 ) -> Image.Image:
-    if padding < 0:
+    if padding is not None:
+        padding_top = padding
+        padding_right = padding
+        padding_bottom = padding
+        padding_left = padding
+
+    paddings = (padding_top, padding_right, padding_bottom, padding_left)
+    if any(value < 0 for value in paddings):
         raise ValueError("padding은 0px 이상이어야 합니다.")
 
     image = image.convert("RGBA")
     width, height = image.size
-    canvas_size = (width + padding * 2, height + padding * 2)
+    canvas_size = (
+        width + padding_left + padding_right,
+        height + padding_top + padding_bottom,
+    )
 
     if transparent_background:
         fill = (0, 0, 0, 0)
@@ -244,7 +258,7 @@ def apply_padding_and_background(
         fill = (red, green, blue, 255)
 
     canvas = Image.new("RGBA", canvas_size, fill)
-    canvas.alpha_composite(image, dest=(padding, padding))
+    canvas.alpha_composite(image, dest=(padding_left, padding_top))
     return canvas
 
 

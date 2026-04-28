@@ -361,7 +361,10 @@ def build_output_image(
     width: int,
     height: int,
     resize_mode: str,
-    padding: int,
+    padding_top: int,
+    padding_right: int,
+    padding_bottom: int,
+    padding_left: int,
     transparent_background: bool,
     background_color: str,
 ):
@@ -374,7 +377,10 @@ def build_output_image(
     )
     output = apply_padding_and_background(
         resized,
-        padding=padding,
+        padding_top=padding_top,
+        padding_right=padding_right,
+        padding_bottom=padding_bottom,
+        padding_left=padding_left,
         transparent_background=transparent_background,
         background_color=background_color,
     )
@@ -397,6 +403,7 @@ def normalize_resize_mode(value: Any) -> str:
 
 
 def initialize_image_state(image_id: str) -> None:
+    legacy_padding = int(st.session_state.get(image_state_key(image_id, "padding"), 0))
     defaults: dict[str, Any] = {
         "model_name": "u2net",
         "alpha_threshold": 16,
@@ -412,6 +419,10 @@ def initialize_image_state(image_id: str) -> None:
         "rotation_degrees": 0,
         "resize_mode": "contain_center",
         "padding": 0,
+        "padding_top": legacy_padding,
+        "padding_right": legacy_padding,
+        "padding_bottom": legacy_padding,
+        "padding_left": legacy_padding,
         "transparent_background": True,
         "background_color": "#000000",
     }
@@ -469,6 +480,18 @@ def image_settings(image_id: str) -> dict[str, Any]:
             st.session_state[image_state_key(image_id, "resize_mode")]
         ),
         "padding": int(st.session_state[image_state_key(image_id, "padding")]),
+        "padding_top": int(
+            st.session_state[image_state_key(image_id, "padding_top")]
+        ),
+        "padding_right": int(
+            st.session_state[image_state_key(image_id, "padding_right")]
+        ),
+        "padding_bottom": int(
+            st.session_state[image_state_key(image_id, "padding_bottom")]
+        ),
+        "padding_left": int(
+            st.session_state[image_state_key(image_id, "padding_left")]
+        ),
         "transparent_background": bool(
             st.session_state[image_state_key(image_id, "transparent_background")]
         ),
@@ -590,7 +613,10 @@ def render_compact_controls(
     lock_key = image_state_key(image_id, "aspect_locked")
     rotation_key = image_state_key(image_id, "rotation_degrees")
     resize_key = image_state_key(image_id, "resize_mode")
-    padding_key = image_state_key(image_id, "padding")
+    padding_top_key = image_state_key(image_id, "padding_top")
+    padding_right_key = image_state_key(image_id, "padding_right")
+    padding_bottom_key = image_state_key(image_id, "padding_bottom")
+    padding_left_key = image_state_key(image_id, "padding_left")
     transparent_key = image_state_key(image_id, "transparent_background")
     background_key = image_state_key(image_id, "background_color")
 
@@ -699,7 +725,7 @@ def render_compact_controls(
             width="stretch",
         )
 
-    background_option_cols = st.columns([1.4, 1, 1, 1], vertical_alignment="bottom")
+    background_option_cols = st.columns([1.4, 1, 1], vertical_alignment="bottom")
     with background_option_cols[0]:
         st.slider(
             "각도",
@@ -710,26 +736,35 @@ def render_compact_controls(
             help="양수는 시계 방향, 음수는 반시계 방향으로 회전합니다.",
         )
     with background_option_cols[1]:
-        st.number_input(
-            "Padding",
-            min_value=0,
-            max_value=MAX_OUTPUT_SIZE,
-            step=1,
-            key=padding_key,
-            help="현재 Output 이미지 바깥쪽에 추가할 여백(px)입니다.",
-        )
-    with background_option_cols[2]:
         st.checkbox(
             "투명 배경",
             key=transparent_key,
             help="끄면 지정한 배경색으로 투명 영역과 padding을 채웁니다.",
         )
-    with background_option_cols[3]:
+    with background_option_cols[2]:
         st.color_picker(
             "배경색",
             key=background_key,
             disabled=bool(st.session_state[transparent_key]),
         )
+
+    padding_cols = st.columns(4, vertical_alignment="bottom")
+    padding_fields = [
+        ("Padding 상", padding_top_key),
+        ("Padding 우", padding_right_key),
+        ("Padding 하", padding_bottom_key),
+        ("Padding 좌", padding_left_key),
+    ]
+    for column, (label, key) in zip(padding_cols, padding_fields, strict=True):
+        with column:
+            st.number_input(
+                label,
+                min_value=0,
+                max_value=MAX_OUTPUT_SIZE,
+                step=1,
+                key=key,
+                help="현재 Output 이미지 바깥쪽에 추가할 여백(px)입니다.",
+            )
 
 
 def process_item_output(
@@ -769,7 +804,10 @@ def process_item_output(
         target_width,
         target_height,
         resize_mode,
-        settings["padding"],
+        settings["padding_top"],
+        settings["padding_right"],
+        settings["padding_bottom"],
+        settings["padding_left"],
         settings["transparent_background"],
         settings["background_color"],
     )
@@ -862,7 +900,10 @@ def render_image_card(item: dict[str, Any]) -> None:
             f"final={output['size'][0]}x{output['size'][1]}px · "
             f"angle={settings['rotation_degrees']}deg · "
             f"erase={'on' if settings['erase_enabled'] and settings['erase_mask_data_url'] else 'off'} · "
-            f"padding={settings['padding']}px · "
+            f"padding=top {settings['padding_top']}px, "
+            f"right {settings['padding_right']}px, "
+            f"bottom {settings['padding_bottom']}px, "
+            f"left {settings['padding_left']}px · "
             f"background={'transparent' if settings['transparent_background'] else settings['background_color']} · "
             f"mode={RESIZE_MODE_OPTIONS[settings['resize_mode']]} · "
             f"removed={trimmed_width}px width, {trimmed_height}px height"
