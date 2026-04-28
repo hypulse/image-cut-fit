@@ -120,6 +120,18 @@ def rotate_image(
         return rotated
 
 
+def apply_erase_mask(image: Image.Image, mask: Image.Image) -> Image.Image:
+    image = image.convert("RGBA")
+    mask = mask.convert("RGBA")
+    if mask.size != image.size:
+        mask = mask.resize(image.size, Image.Resampling.LANCZOS)
+
+    image_pixels = np.array(image)
+    mask_alpha = np.array(mask.getchannel("A"))
+    image_pixels[mask_alpha > 0, 3] = 0
+    return Image.fromarray(image_pixels, mode="RGBA")
+
+
 def extract_connected_components(
     image: Image.Image,
     *,

@@ -9,9 +9,11 @@ from pathlib import Path
 from typing import Any
 
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
 
 from image_pipeline import (
+    apply_erase_mask,
     apply_padding_and_background,
     crop_to_alpha_bbox,
     image_to_png_bytes,
@@ -24,6 +26,7 @@ from image_pipeline import (
 
 
 OUTPUT_DIR = Path(__file__).parent / "outputs"
+ERASER_COMPONENT_DIR = Path(__file__).parent / "components" / "eraser_canvas"
 MODEL_OPTIONS = {
     "u2net": "u2net - 기본",
     "isnet-general-use": "isnet-general-use - 일반 이미지 보존 우선",
@@ -41,8 +44,14 @@ MAX_OUTPUT_SIZE = 8192
 PREVIEW_MAX_WIDTH = 520
 PREVIEW_FRAME_HEIGHT = 240
 PREVIEW_RENDER_SCALE = 2
+ERASER_MAX_DIMENSION = 1024
 MIN_ROTATION_DEGREES = -180
 MAX_ROTATION_DEGREES = 180
+
+eraser_canvas = components.declare_component(
+    "eraser_canvas",
+    path=str(ERASER_COMPONENT_DIR),
+)
 
 
 def safe_stem(original_name: str) -> str:
@@ -78,6 +87,15 @@ def shrink_for_preview(image: Image.Image) -> Image.Image:
     return preview
 
 
+def shrink_for_eraser(image: Image.Image) -> Image.Image:
+    editor_image = image.copy().convert("RGBA")
+    editor_image.thumbnail(
+        (ERASER_MAX_DIMENSION, ERASER_MAX_DIMENSION),
+        Image.Resampling.LANCZOS,
+    )
+    return editor_image
+
+
 def checkerboard_preview(image: Image.Image, square_size: int = 16) -> bytes:
     image = shrink_for_preview(image)
     width, height = image.size
@@ -103,6 +121,13 @@ def checkerboard_preview(image: Image.Image, square_size: int = 16) -> bytes:
 def png_data_uri(image_bytes: bytes) -> str:
     encoded = base64.b64encode(image_bytes).decode("ascii")
     return f"data:image/png;base64,{encoded}"
+
+
+def png_bytes_from_data_url(data_url: str) -> bytes:
+    header, separator, payload = data_url.partition(",")
+    if not separator or "base64" not in header or not header.startswith("data:image/png"):
+        raise ValueError("지원하지 않는 마스크 데이터 형식입니다.")
+    return base64.b64decode(payload)
 
 
 def render_fixed_preview(image_bytes: bytes, *, alt: str) -> None:
@@ -203,6 +228,44 @@ def process_alpha_crop(image_bytes: bytes, alpha_threshold: int):
 
 
 @st.cache_data(show_spinner=False)
+def process_manual_erase(
+    cropped_png_bytes: bytes,
+    erase_mask_data_url: str,
+    alpha_threshold: int,
+):
+    cropped = Image.open(BytesIO(cropped_png_bytes)).convert("RGBA")
+    bbox = (0, 0, cropped.width, cropped.height)
+    if erase_mask_data_url:
+        mask = Image.open(BytesIO(png_bytes_from_data_url(erase_mask_data_url)))
+        cropped = apply_erase_mask(cropped, mask)
+        try:
+            cropped, bbox = crop_to_alpha_bbox(
+                cropped,
+                alpha_threshold=alpha_threshold,
+            )
+        except ValueError:
+            cropped = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+            bbox = (0, 0, 1, 1)
+
+    return {
+        "png_bytes": image_to_png_bytes(cropped),
+        "preview_bytes": checkerboard_preview(cropped),
+        "size": cropped.size,
+        "bbox": bbox,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def process_eraser_editor_image(cropped_png_bytes: bytes):
+    cropped = Image.open(BytesIO(cropped_png_bytes)).convert("RGBA")
+    editor_image = shrink_for_eraser(cropped)
+    return {
+        "png_bytes": image_to_png_bytes(editor_image),
+        "size": editor_image.size,
+    }
+
+
+@st.cache_data(show_spinner=False)
 def process_rotation(
     cropped_png_bytes: bytes,
     rotation_degrees: int,
@@ -299,6 +362,10 @@ def initialize_image_state(image_id: str) -> None:
         "aspect_locked": True,
         "output_width": 0,
         "output_height": 0,
+        "erase_enabled": False,
+        "erase_mask_data_url": "",
+        "erase_brush_size": 24,
+        "erase_revision": 0,
         "rotation_degrees": 0,
         "resize_mode": "contain_center",
         "padding": 0,
@@ -339,6 +406,18 @@ def image_settings(image_id: str) -> dict[str, Any]:
         "output_width": int(st.session_state[image_state_key(image_id, "output_width")]),
         "output_height": int(
             st.session_state[image_state_key(image_id, "output_height")]
+        ),
+        "erase_enabled": bool(
+            st.session_state[image_state_key(image_id, "erase_enabled")]
+        ),
+        "erase_mask_data_url": st.session_state[
+            image_state_key(image_id, "erase_mask_data_url")
+        ],
+        "erase_brush_size": int(
+            st.session_state[image_state_key(image_id, "erase_brush_size")]
+        ),
+        "erase_revision": int(
+            st.session_state[image_state_key(image_id, "erase_revision")]
         ),
         "rotation_degrees": int(
             st.session_state[image_state_key(image_id, "rotation_degrees")]
@@ -397,6 +476,62 @@ def current_target_size(
     settings = image_settings(image_id)
     target_width, target_height = target_size_for_settings(settings, cropped_size)
     return target_width, target_height, settings["resize_mode"]
+
+
+def reset_erase_mask(image_id: str) -> None:
+    mask_key = image_state_key(image_id, "erase_mask_data_url")
+    revision_key = image_state_key(image_id, "erase_revision")
+    st.session_state[mask_key] = ""
+    st.session_state[revision_key] = int(st.session_state.get(revision_key, 0)) + 1
+
+
+def render_erase_editor(image_id: str, cropped_png_bytes: bytes) -> None:
+    enabled_key = image_state_key(image_id, "erase_enabled")
+    mask_key = image_state_key(image_id, "erase_mask_data_url")
+    brush_key = image_state_key(image_id, "erase_brush_size")
+    revision_key = image_state_key(image_id, "erase_revision")
+
+    control_cols = st.columns([1, 1, 2], vertical_alignment="bottom")
+    with control_cols[0]:
+        st.checkbox(
+            "수동 지우기",
+            key=enabled_key,
+            help="켜면 아래 캔버스에 그린 영역이 투명하게 지워집니다.",
+        )
+    with control_cols[1]:
+        st.slider(
+            "브러시",
+            min_value=1,
+            max_value=160,
+            step=1,
+            key=brush_key,
+            disabled=not bool(st.session_state[enabled_key]),
+        )
+    with control_cols[2]:
+        st.button(
+            "마스크 초기화",
+            key=image_state_key(image_id, "erase_reset"),
+            on_click=reset_erase_mask,
+            args=(image_id,),
+            disabled=not bool(st.session_state[mask_key]),
+            use_container_width=True,
+        )
+
+    if not bool(st.session_state[enabled_key]):
+        return
+
+    mask_data_url = st.session_state[mask_key]
+    editor_image = process_eraser_editor_image(cropped_png_bytes)
+    component_value = eraser_canvas(
+        image_data_url=png_data_uri(editor_image["png_bytes"]),
+        mask_data_url=mask_data_url,
+        brush_size=int(st.session_state[brush_key]),
+        key=f"{image_state_key(image_id, 'erase_canvas')}_{st.session_state[revision_key]}",
+        default=mask_data_url,
+    )
+    if isinstance(component_value, str) and component_value != mask_data_url:
+        st.session_state[mask_key] = component_value
+        st.rerun()
 
 
 def render_compact_controls(
@@ -552,7 +687,7 @@ def render_compact_controls(
 
 def process_item_output(
     item: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], int, int]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], int, int]:
     settings = image_settings(item["id"])
     if item.get("kind") == "sprite":
         crop = process_alpha_crop(
@@ -567,8 +702,13 @@ def process_item_output(
             settings["preserve_interior"],
             settings["post_process_mask"],
         )
-    rotated = process_rotation(
+    erased = process_manual_erase(
         crop["png_bytes"],
+        settings["erase_mask_data_url"] if settings["erase_enabled"] else "",
+        settings["alpha_threshold"],
+    )
+    rotated = process_rotation(
+        erased["png_bytes"],
         settings["rotation_degrees"],
         settings["alpha_threshold"],
     )
@@ -586,7 +726,7 @@ def process_item_output(
         settings["transparent_background"],
         settings["background_color"],
     )
-    return crop, rotated, output, target_width, target_height
+    return crop, erased, rotated, output, target_width, target_height
 
 
 def save_output(item: dict[str, Any], png_bytes: bytes, width: int, height: int) -> Path:
@@ -610,7 +750,7 @@ def render_image_card(item: dict[str, Any]) -> None:
 
         try:
             with st.spinner(f"{item['name']} 처리 중..."):
-                crop, rotated, output, target_width, target_height = (
+                crop, erased, rotated, output, target_width, target_height = (
                     process_item_output(item)
                 )
         except Exception as exc:
@@ -644,7 +784,7 @@ def render_image_card(item: dict[str, Any]) -> None:
         with preview_cols[1]:
             st.caption("Cropped")
             render_fixed_preview(
-                crop["preview_bytes"],
+                erased["preview_bytes"],
                 alt=f"{item['name']} cropped",
             )
         with preview_cols[2]:
@@ -669,15 +809,19 @@ def render_image_card(item: dict[str, Any]) -> None:
             f"source={source_width}x{source_height}px · "
             f"bbox=({x0}, {y0}, {x1}, {y1}) · "
             f"cropped={cropped_width}x{cropped_height}px · "
+            f"recropped={erased['size'][0]}x{erased['size'][1]}px · "
             f"rotated={rotated['size'][0]}x{rotated['size'][1]}px · "
             f"resized={target_width}x{target_height}px · "
             f"final={output['size'][0]}x{output['size'][1]}px · "
             f"angle={settings['rotation_degrees']}deg · "
+            f"erase={'on' if settings['erase_enabled'] and settings['erase_mask_data_url'] else 'off'} · "
             f"padding={settings['padding']}px · "
             f"background={'transparent' if settings['transparent_background'] else settings['background_color']} · "
             f"mode={RESIZE_MODE_OPTIONS[settings['resize_mode']]} · "
             f"removed={trimmed_width}px width, {trimmed_height}px height"
         )
+
+        render_erase_editor(item["id"], crop["png_bytes"])
 
         render_compact_controls(
             item["id"],
@@ -851,7 +995,7 @@ if st.button("모든 이미지 저장", type="primary", use_container_width=True
             text=f"{item['name']} 처리 중...",
         )
         try:
-            _, _, item_output, item_width, item_height = process_item_output(item)
+            _, _, _, item_output, item_width, item_height = process_item_output(item)
             final_width, final_height = item_output["size"]
             saved_paths.append(
                 save_output(

@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      font-family: sans-serif;
+      background: transparent;
+    }
+
+    .editor {
+      width: 100%;
+      box-sizing: border-box;
+    }
+
+    .canvas-shell {
+      height: 420px;
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      border: 1px solid rgba(49, 51, 63, 0.16);
+      border-radius: 6px;
+      background-color: #fafafa;
+      background-image:
+        linear-gradient(45deg, #e1e1e1 25%, transparent 25%),
+        linear-gradient(-45deg, #e1e1e1 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, #e1e1e1 75%),
+        linear-gradient(-45deg, transparent 75%, #e1e1e1 75%);
+      background-size: 24px 24px;
+      background-position: 0 0, 0 12px, 12px -12px, -12px 0;
+    }
+
+    canvas {
+      display: block;
+      max-width: 100%;
+      max-height: 100%;
+      width: auto;
+      height: auto;
+      cursor: crosshair;
+      touch-action: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="editor">
+    <div class="canvas-shell">
+      <canvas id="paint"></canvas>
+    </div>
+  </div>
+
+  <script>
+    const Streamlit = {
+      setComponentReady() {
+        window.parent.postMessage(
+          { isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 },
+          "*",
+        );
+      },
+      setComponentValue(value) {
+        window.parent.postMessage(
+          {
+            isStreamlitMessage: true,
+            type: "streamlit:setComponentValue",
+            value,
+            dataType: "json",
+          },
+          "*",
+        );
+      },
+      setFrameHeight(height) {
+        window.parent.postMessage(
+          { isStreamlitMessage: true, type: "streamlit:setFrameHeight", height },
+          "*",
+        );
+      },
+    };
+
+    const canvas = document.getElementById("paint");
+    const ctx = canvas.getContext("2d");
+    const maskCanvas = document.createElement("canvas");
+    const maskCtx = maskCanvas.getContext("2d");
+
+    let image = null;
+    let brushSize = 24;
+    let isDrawing = false;
+    let lastPoint = null;
+    let latestImageDataUrl = "";
+    let latestMaskDataUrl = "";
+
+    function loadImage(src) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = reject;
+        img.src = src;
+      });
+    }
+
+    function resizeCanvases(width, height) {
+      canvas.width = width;
+      canvas.height = height;
+      maskCanvas.width = width;
+      maskCanvas.height = height;
+    }
+
+    function drawCheckerboard(targetCtx, width, height) {
+      const square = 16;
+      targetCtx.fillStyle = "#ffffff";
+      targetCtx.fillRect(0, 0, width, height);
+      for (let y = 0; y < height; y += square) {
+        for (let x = 0; x < width; x += square) {
+          targetCtx.fillStyle = ((x / square + y / square) % 2 === 0)
+            ? "#dddddd"
+            : "#f8f8f8";
+          targetCtx.fillRect(x, y, square, square);
+        }
+      }
+    }
+
+    function renderCanvas() {
+      if (!image) return;
+
+      const width = canvas.width;
+      const height = canvas.height;
+      const imageLayer = document.createElement("canvas");
+      imageLayer.width = width;
+      imageLayer.height = height;
+      const imageLayerCtx = imageLayer.getContext("2d");
+
+      imageLayerCtx.clearRect(0, 0, width, height);
+      imageLayerCtx.drawImage(image, 0, 0, width, height);
+      imageLayerCtx.globalCompositeOperation = "destination-out";
+      imageLayerCtx.drawImage(maskCanvas, 0, 0, width, height);
+      imageLayerCtx.globalCompositeOperation = "source-over";
+
+      ctx.clearRect(0, 0, width, height);
+      drawCheckerboard(ctx, width, height);
+      ctx.drawImage(imageLayer, 0, 0);
+    }
+
+    function canvasPoint(event) {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: (event.clientX - rect.left) * canvas.width / rect.width,
+        y: (event.clientY - rect.top) * canvas.height / rect.height,
+      };
+    }
+
+    function eraseAt(point) {
+      maskCtx.save();
+      maskCtx.globalCompositeOperation = "source-over";
+      maskCtx.strokeStyle = "rgba(255, 255, 255, 1)";
+      maskCtx.fillStyle = "rgba(255, 255, 255, 1)";
+      maskCtx.lineCap = "round";
+      maskCtx.lineJoin = "round";
+      maskCtx.lineWidth = brushSize;
+
+      if (lastPoint) {
+        maskCtx.beginPath();
+        maskCtx.moveTo(lastPoint.x, lastPoint.y);
+        maskCtx.lineTo(point.x, point.y);
+        maskCtx.stroke();
+      } else {
+        maskCtx.beginPath();
+        maskCtx.arc(point.x, point.y, brushSize / 2, 0, Math.PI * 2);
+        maskCtx.fill();
+      }
+
+      maskCtx.restore();
+      lastPoint = point;
+      renderCanvas();
+    }
+
+    function sendMask() {
+      const imageData = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+      const pixels = imageData.data;
+      let hasMask = false;
+      for (let index = 3; index < pixels.length; index += 4) {
+        if (pixels[index] > 0) {
+          hasMask = true;
+          break;
+        }
+      }
+      Streamlit.setComponentValue(hasMask ? maskCanvas.toDataURL("image/png") : "");
+    }
+
+    canvas.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      canvas.setPointerCapture(event.pointerId);
+      isDrawing = true;
+      lastPoint = null;
+      eraseAt(canvasPoint(event));
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+      if (!isDrawing) return;
+      event.preventDefault();
+      eraseAt(canvasPoint(event));
+    });
+
+    function finishDrawing(event) {
+      if (!isDrawing) return;
+      event.preventDefault();
+      isDrawing = false;
+      lastPoint = null;
+      sendMask();
+    }
+
+    canvas.addEventListener("pointerup", finishDrawing);
+    canvas.addEventListener("pointercancel", finishDrawing);
+    canvas.addEventListener("pointerleave", finishDrawing);
+
+    async function render(args) {
+      const nextImageDataUrl = args.image_data_url || "";
+      const nextMaskDataUrl = args.mask_data_url || "";
+      brushSize = Number(args.brush_size || 24);
+
+      if (!nextImageDataUrl) {
+        Streamlit.setFrameHeight(424);
+        return;
+      }
+
+      const shouldReloadImage = nextImageDataUrl !== latestImageDataUrl;
+      const shouldReloadMask = shouldReloadImage || nextMaskDataUrl !== latestMaskDataUrl;
+
+      if (shouldReloadImage) {
+        image = await loadImage(nextImageDataUrl);
+        resizeCanvases(image.naturalWidth, image.naturalHeight);
+        latestImageDataUrl = nextImageDataUrl;
+      }
+
+      if (shouldReloadMask) {
+        maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+        if (nextMaskDataUrl) {
+          const maskImage = await loadImage(nextMaskDataUrl);
+          maskCtx.drawImage(maskImage, 0, 0, maskCanvas.width, maskCanvas.height);
+        }
+        latestMaskDataUrl = nextMaskDataUrl;
+      }
+
+      renderCanvas();
+      Streamlit.setFrameHeight(424);
+    }
+
+    window.addEventListener("message", (event) => {
+      if (event.data.type !== "streamlit:render") return;
+      render(event.data.args || {});
+    });
+
+    Streamlit.setComponentReady();
+    Streamlit.setFrameHeight(424);
+  </script>
+</body>
+</html>
