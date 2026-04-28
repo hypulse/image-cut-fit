@@ -16,6 +16,7 @@ from image_pipeline import (
     apply_erase_mask,
     apply_padding_and_background,
     crop_to_alpha_bbox,
+    extract_connected_components,
     image_to_png_bytes,
     load_image,
     remove_background_and_crop,
@@ -27,10 +28,12 @@ from image_pipeline import (
 
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 ERASER_COMPONENT_DIR = Path(__file__).parent / "components" / "eraser_canvas"
+MODEL_NONE = "none"
 MODEL_OPTIONS = {
     "u2net": "u2net - 기본",
     "isnet-general-use": "isnet-general-use - 일반 이미지 보존 우선",
     "isnet-anime": "isnet-anime - 일러스트/애니풍",
+    MODEL_NONE: "모델 선택하지 않음 - 원본 기준",
 }
 RESIZE_MODE_OPTIONS = {
     "contain_center": "비율 유지 중앙",
@@ -196,13 +199,37 @@ def process_crop(
     preserve_interior: bool,
     post_process_mask: bool,
 ):
-    result = remove_background_and_crop(
-        image_bytes,
-        alpha_threshold=alpha_threshold,
-        preserve_interior=preserve_interior,
-        post_process_mask=post_process_mask,
-        session=get_rembg_session(model_name),
-    )
+    if model_name == MODEL_NONE:
+        return process_alpha_crop(image_bytes, alpha_threshold)
+
+    fallback_reason = ""
+    try:
+        result = remove_background_and_crop(
+            image_bytes,
+            alpha_threshold=alpha_threshold,
+            preserve_interior=preserve_interior,
+            post_process_mask=post_process_mask,
+            session=get_rembg_session(model_name),
+        )
+    except ValueError as exc:
+        source = load_image(image_bytes)
+        try:
+            cropped, bbox = crop_to_alpha_bbox(source, alpha_threshold=alpha_threshold)
+        except ValueError:
+            cropped = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+            bbox = (0, 0, 1, 1)
+
+        fallback_reason = f"모델 crop 실패, 원본 기준으로 편집합니다: {exc}"
+        return {
+            "png_bytes": image_to_png_bytes(cropped),
+            "preview_bytes": checkerboard_preview(cropped),
+            "bbox": bbox,
+            "source_size": source.size,
+            "cropped_size": cropped.size,
+            "removed_size": source.size,
+            "fallback_reason": fallback_reason,
+        }
+
     return {
         "png_bytes": result.png_bytes,
         "preview_bytes": checkerboard_preview(result.cropped),
@@ -210,13 +237,21 @@ def process_crop(
         "source_size": result.source_size,
         "cropped_size": result.cropped.size,
         "removed_size": result.removed_background.size,
+        "fallback_reason": fallback_reason,
     }
 
 
 @st.cache_data(show_spinner=False)
 def process_alpha_crop(image_bytes: bytes, alpha_threshold: int):
     source = load_image(image_bytes)
-    cropped, bbox = crop_to_alpha_bbox(source, alpha_threshold=alpha_threshold)
+    try:
+        cropped, bbox = crop_to_alpha_bbox(source, alpha_threshold=alpha_threshold)
+        fallback_reason = ""
+    except ValueError as exc:
+        cropped = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+        bbox = (0, 0, 1, 1)
+        fallback_reason = f"원본 crop 실패, 투명 이미지로 편집합니다: {exc}"
+
     return {
         "png_bytes": image_to_png_bytes(cropped),
         "preview_bytes": checkerboard_preview(cropped),
@@ -224,6 +259,7 @@ def process_alpha_crop(image_bytes: bytes, alpha_threshold: int):
         "source_size": source.size,
         "cropped_size": cropped.size,
         "removed_size": source.size,
+        "fallback_reason": fallback_reason,
     }
 
 
@@ -293,14 +329,21 @@ def process_sprite_sheet(
     post_process_mask: bool,
     min_area: int,
 ):
-    components = remove_background_and_extract_sprites(
-        image_bytes,
-        alpha_threshold=alpha_threshold,
-        min_area=min_area,
-        preserve_interior=preserve_interior,
-        post_process_mask=post_process_mask,
-        session=get_rembg_session(model_name),
-    )
+    if model_name == MODEL_NONE:
+        components = extract_connected_components(
+            load_image(image_bytes),
+            alpha_threshold=alpha_threshold,
+            min_area=min_area,
+        )
+    else:
+        components = remove_background_and_extract_sprites(
+            image_bytes,
+            alpha_threshold=alpha_threshold,
+            min_area=min_area,
+            preserve_interior=preserve_interior,
+            post_process_mask=post_process_mask,
+            session=get_rembg_session(model_name),
+        )
     return [
         {
             "png_bytes": component.png_bytes,
@@ -553,15 +596,17 @@ def render_compact_controls(
 
     st.caption("옵션")
     if show_background_controls:
+        model_key = image_state_key(image_id, "model_name")
         background_cols = st.columns([1.5, 1.3, 0.9, 0.9], vertical_alignment="bottom")
         with background_cols[0]:
             st.selectbox(
                 "모델",
                 options=list(MODEL_OPTIONS.keys()),
                 format_func=lambda value: MODEL_OPTIONS[value],
-                key=image_state_key(image_id, "model_name"),
-                help="객체 내부가 많이 지워지면 isnet-general-use를, 일러스트/애니풍이면 isnet-anime을 시도하세요.",
+                key=model_key,
+                help="모델 선택하지 않음은 배경 제거를 건너뛰고 원본 alpha 기준으로 편집합니다.",
             )
+        model_disabled = st.session_state[model_key] == MODEL_NONE
         with background_cols[1]:
             st.slider(
                 "Alpha",
@@ -575,12 +620,14 @@ def render_compact_controls(
                 "내부 복원",
                 key=image_state_key(image_id, "preserve_interior"),
                 help="외곽선 안쪽에서 투명해진 영역을 원본 색상으로 다시 채웁니다.",
+                disabled=model_disabled,
             )
         with background_cols[3]:
             st.checkbox(
                 "마스크",
                 key=image_state_key(image_id, "post_process_mask"),
                 help="경계를 매끄럽게 할 수 있지만 작은 내부 디테일은 더 사라질 수 있습니다.",
+                disabled=model_disabled,
             )
     else:
         st.slider(
@@ -820,6 +867,8 @@ def render_image_card(item: dict[str, Any]) -> None:
             f"mode={RESIZE_MODE_OPTIONS[settings['resize_mode']]} · "
             f"removed={trimmed_width}px width, {trimmed_height}px height"
         )
+        if crop.get("fallback_reason"):
+            st.warning(crop["fallback_reason"])
 
         render_erase_editor(item["id"], crop["png_bytes"])
 
@@ -870,7 +919,7 @@ uploaded_files = st.file_uploader(
 sprite_sheet_mode = st.toggle(
     "스프라이트 시트 분리",
     value=False,
-    help="업로드 이미지를 먼저 배경 제거한 뒤 연결되지 않은 알파 영역을 각각의 스프라이트로 분리합니다.",
+    help="업로드 이미지를 배경 제거하거나 원본 alpha 기준으로 연결되지 않은 영역을 각각의 스프라이트로 분리합니다.",
 )
 
 sheet_settings: dict[str, Any] = {}
@@ -883,7 +932,9 @@ if sprite_sheet_mode:
                 options=list(MODEL_OPTIONS.keys()),
                 format_func=lambda value: MODEL_OPTIONS[value],
                 key="sheet_model_name",
+                help="모델 선택하지 않음은 배경 제거 없이 원본 alpha 연결 영역을 분리합니다.",
             )
+            sheet_model_disabled = sheet_settings["model_name"] == MODEL_NONE
         with sheet_cols[1]:
             sheet_settings["alpha_threshold"] = st.slider(
                 "시트 Alpha",
@@ -897,12 +948,14 @@ if sprite_sheet_mode:
                 "내부 복원",
                 value=True,
                 key="sheet_preserve_interior",
+                disabled=sheet_model_disabled,
             )
         with sheet_cols[3]:
             sheet_settings["post_process_mask"] = st.checkbox(
                 "마스크",
                 value=True,
                 key="sheet_post_process_mask",
+                disabled=sheet_model_disabled,
             )
         with sheet_cols[4]:
             sheet_settings["min_area"] = int(
