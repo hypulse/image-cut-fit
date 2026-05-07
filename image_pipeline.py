@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Any
@@ -32,6 +33,31 @@ class SpriteComponent:
         return image_to_png_bytes(self.image)
 
 
+@dataclass(frozen=True)
+class SpriteSheetPlacement:
+    index: int
+    source_size: tuple[int, int]
+    cell_box: tuple[int, int, int, int]
+    paste_box: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class SpriteSheetResult:
+    image: Image.Image
+    unscaled_size: tuple[int, int]
+    scaled_size: tuple[int, int]
+    cell_size: tuple[int, int]
+    columns: int
+    rows: int
+    gap: int
+    scale: float
+    placements: tuple[SpriteSheetPlacement, ...]
+
+    @property
+    def png_bytes(self) -> bytes:
+        return image_to_png_bytes(self.image)
+
+
 def image_to_png_bytes(image: Image.Image) -> bytes:
     buffer = BytesIO()
     image.save(buffer, format="PNG")
@@ -42,6 +68,126 @@ def load_image(image_bytes: bytes) -> Image.Image:
     image = Image.open(BytesIO(image_bytes))
     image = ImageOps.exif_transpose(image)
     return image.convert("RGBA")
+
+
+def best_squareish_grid(
+    count: int,
+    *,
+    cell_width: int,
+    cell_height: int,
+    gap: int = 0,
+) -> tuple[int, int]:
+    if count < 1:
+        raise ValueError("이미지가 하나 이상 필요합니다.")
+    if cell_width < 1 or cell_height < 1:
+        raise ValueError("셀 크기는 1px 이상이어야 합니다.")
+    if gap < 0:
+        raise ValueError("간격은 0px 이상이어야 합니다.")
+
+    best: tuple[float, int, int, int, int] | None = None
+    for columns in range(1, count + 1):
+        rows = math.ceil(count / columns)
+        width = columns * cell_width + (columns - 1) * gap
+        height = rows * cell_height + (rows - 1) * gap
+        ratio_score = abs(math.log(width / height))
+        empty_cells = columns * rows - count
+        area = width * height
+        candidate = (ratio_score, empty_cells, area, columns, rows)
+        if best is None or candidate < best:
+            best = candidate
+
+    assert best is not None
+    return best[3], best[4]
+
+
+def resampling_filter(name: str) -> Image.Resampling:
+    if name == "nearest":
+        return Image.Resampling.NEAREST
+    if name == "lanczos":
+        return Image.Resampling.LANCZOS
+    raise ValueError(f"지원하지 않는 스케일 방식입니다: {name}")
+
+
+def build_square_sprite_sheet(
+    images: Sequence[Image.Image],
+    *,
+    scale: float = 1.0,
+    gap: int = 0,
+    resampling: str = "nearest",
+    max_dimension: int | None = None,
+) -> SpriteSheetResult:
+    if not images:
+        raise ValueError("이미지가 하나 이상 필요합니다.")
+    if scale <= 0:
+        raise ValueError("스케일은 0보다 커야 합니다.")
+    if gap < 0:
+        raise ValueError("간격은 0px 이상이어야 합니다.")
+
+    rgba_images = [image.convert("RGBA") for image in images]
+    cell_width = max(image.width for image in rgba_images)
+    cell_height = max(image.height for image in rgba_images)
+    columns, rows = best_squareish_grid(
+        len(rgba_images),
+        cell_width=cell_width,
+        cell_height=cell_height,
+        gap=gap,
+    )
+    unscaled_size = (
+        columns * cell_width + (columns - 1) * gap,
+        rows * cell_height + (rows - 1) * gap,
+    )
+
+    canvas = Image.new("RGBA", unscaled_size, (0, 0, 0, 0))
+    placements: list[SpriteSheetPlacement] = []
+    for index, image in enumerate(rgba_images):
+        row = index // columns
+        column = index % columns
+        cell_x = column * (cell_width + gap)
+        cell_y = row * (cell_height + gap)
+        paste_x = cell_x + (cell_width - image.width) // 2
+        paste_y = cell_y + (cell_height - image.height) // 2
+        canvas.alpha_composite(image, dest=(paste_x, paste_y))
+        placements.append(
+            SpriteSheetPlacement(
+                index=index,
+                source_size=image.size,
+                cell_box=(cell_x, cell_y, cell_x + cell_width, cell_y + cell_height),
+                paste_box=(
+                    paste_x,
+                    paste_y,
+                    paste_x + image.width,
+                    paste_y + image.height,
+                ),
+            )
+        )
+
+    scaled_size = (
+        max(1, round(unscaled_size[0] * scale)),
+        max(1, round(unscaled_size[1] * scale)),
+    )
+    if max_dimension is not None and (
+        scaled_size[0] > max_dimension or scaled_size[1] > max_dimension
+    ):
+        raise ValueError(
+            f"스케일 적용 후 최대 크기 {max_dimension}px를 넘습니다: "
+            f"{scaled_size[0]}x{scaled_size[1]}px"
+        )
+
+    output = canvas
+    if scaled_size != unscaled_size:
+        output = canvas.resize(scaled_size, resampling_filter(resampling))
+
+    return SpriteSheetResult(
+        image=output,
+        unscaled_size=unscaled_size,
+        scaled_size=scaled_size,
+        cell_size=(cell_width, cell_height),
+        columns=columns,
+        rows=rows,
+        gap=gap,
+        scale=scale,
+        placements=tuple(placements),
+    )
 
 
 def remove_background(

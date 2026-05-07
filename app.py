@@ -4,23 +4,26 @@ import base64
 import hashlib
 import html
 import re
+import zipfile
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import streamlit as st
 import streamlit.components.v1 as components
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from image_pipeline import (
     apply_erase_mask,
     apply_padding_and_background,
+    build_square_sprite_sheet,
     crop_to_alpha_bbox,
     extract_connected_components,
     image_to_png_bytes,
     load_image,
     remove_background_and_crop,
     remove_background_and_extract_sprites,
+    resampling_filter,
     rotate_image,
     resize_to_target,
 )
@@ -28,6 +31,15 @@ from image_pipeline import (
 
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 ERASER_COMPONENT_DIR = Path(__file__).parent / "components" / "eraser_canvas"
+CLIPBOARD_IMAGE_COMPONENT_DIR = Path(__file__).parent / "components" / "clipboard_image"
+CLIPBOARD_IMAGE_STATE_KEY = "cut_fit_clipboard_images"
+CLIPBOARD_SEEN_STATE_KEY = "cut_fit_clipboard_seen_ids"
+SPRITE_SHEET_BUILDER_CLIPBOARD_IMAGE_STATE_KEY = (
+    "sprite_sheet_builder_clipboard_images"
+)
+SPRITE_SHEET_BUILDER_CLIPBOARD_SEEN_STATE_KEY = (
+    "sprite_sheet_builder_clipboard_seen_ids"
+)
 MODEL_NONE = "none"
 MODEL_OPTIONS = {
     "u2net": "u2net - 기본",
@@ -50,10 +62,35 @@ PREVIEW_RENDER_SCALE = 2
 ERASER_MAX_DIMENSION = 1024
 MIN_ROTATION_DEGREES = -180
 MAX_ROTATION_DEGREES = 180
+SPRITE_SHEET_RESAMPLE_OPTIONS = {
+    "nearest": "Nearest - 픽셀 유지",
+    "lanczos": "Lanczos - 부드럽게",
+}
+TILESET_GUIDE_LAYOUT = (
+    (
+        ("TL", "top_left", "위쪽 왼쪽 모서리"),
+        ("T", "top", "위쪽 가운데"),
+        ("TR", "top_right", "위쪽 오른쪽 모서리"),
+    ),
+    (
+        ("L", "left_wall", "왼쪽 벽"),
+        ("C", "center", "가운데 내부"),
+        ("R", "right_wall", "오른쪽 벽"),
+    ),
+    (
+        ("BL", "bottom_left", "아래쪽 왼쪽 모서리"),
+        ("B", "bottom", "아래쪽 가운데"),
+        ("BR", "bottom_right", "아래쪽 오른쪽 모서리"),
+    ),
+)
 
 eraser_canvas = components.declare_component(
     "eraser_canvas",
     path=str(ERASER_COMPONENT_DIR),
+)
+clipboard_image = components.declare_component(
+    "clipboard_image",
+    path=str(CLIPBOARD_IMAGE_COMPONENT_DIR),
 )
 
 
@@ -133,6 +170,92 @@ def png_bytes_from_data_url(data_url: str) -> bytes:
     return base64.b64decode(payload)
 
 
+def image_bytes_from_data_url(data_url: str) -> tuple[str, bytes]:
+    header, separator, payload = data_url.partition(",")
+    header = header.lower()
+    if not separator or "base64" not in header or not header.startswith("data:image/"):
+        raise ValueError("지원하지 않는 클립보드 이미지 데이터 형식입니다.")
+
+    mime_type = header.removeprefix("data:").split(";", 1)[0]
+    return mime_type, base64.b64decode(payload, validate=True)
+
+
+def clipboard_image_name(original_name: str, index: int) -> str:
+    stem = safe_stem(original_name or f"clipboard_{index:02d}")
+    return f"{stem}.png"
+
+
+def ensure_clipboard_state(image_state_key: str, seen_state_key: str) -> None:
+    if image_state_key not in st.session_state:
+        st.session_state[image_state_key] = []
+    if seen_state_key not in st.session_state:
+        st.session_state[seen_state_key] = []
+
+
+def absorb_clipboard_images(
+    component_value: Any,
+    *,
+    image_state_key: str,
+    seen_state_key: str,
+) -> None:
+    ensure_clipboard_state(image_state_key, seen_state_key)
+    if not isinstance(component_value, dict):
+        return
+
+    batch_id = str(component_value.get("id") or "")
+    seen_ids = st.session_state[seen_state_key]
+    if batch_id and batch_id in seen_ids:
+        return
+
+    image_payloads = component_value.get("images")
+    if not isinstance(image_payloads, list):
+        image_payloads = [component_value]
+
+    pasted_images = st.session_state[image_state_key]
+    existing_digests = {image["digest"] for image in pasted_images}
+    added_count = 0
+    errors: list[str] = []
+
+    for image_payload in image_payloads:
+        if not isinstance(image_payload, dict):
+            continue
+
+        try:
+            _, raw_bytes = image_bytes_from_data_url(
+                str(image_payload.get("data_url") or "")
+            )
+            image = load_image(raw_bytes)
+            image_bytes = image_to_png_bytes(image)
+        except Exception as exc:
+            errors.append(str(exc))
+            continue
+
+        digest = hashlib.sha1(image_bytes).hexdigest()
+        if digest in existing_digests:
+            continue
+
+        index = len(pasted_images) + 1
+        original_name = str(image_payload.get("name") or "")
+        pasted_images.append(
+            {
+                "name": clipboard_image_name(original_name, index),
+                "bytes": image_bytes,
+                "digest": digest,
+                "source": "clipboard",
+            }
+        )
+        existing_digests.add(digest)
+        added_count += 1
+
+    if batch_id:
+        seen_ids.append(batch_id)
+
+    if added_count:
+        st.toast(f"클립보드 이미지 {added_count}개를 추가했습니다.")
+    for error in errors:
+        st.warning(f"클립보드 이미지를 읽지 못했습니다: {error}")
+
+
 def render_fixed_preview(image_bytes: bytes, *, alt: str) -> None:
     safe_alt = html.escape(alt, quote=True)
     st.markdown(
@@ -143,6 +266,179 @@ def render_fixed_preview(image_bytes: bytes, *, alt: str) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_clipboard_upload(
+    *,
+    component_key: str,
+    clear_key: str,
+    image_state_key: str = CLIPBOARD_IMAGE_STATE_KEY,
+    seen_state_key: str = CLIPBOARD_SEEN_STATE_KEY,
+) -> list[dict[str, Any]]:
+    ensure_clipboard_state(image_state_key, seen_state_key)
+    component_value = clipboard_image(
+        default=None,
+        key=component_key,
+    )
+    absorb_clipboard_images(
+        component_value,
+        image_state_key=image_state_key,
+        seen_state_key=seen_state_key,
+    )
+
+    pasted_images = st.session_state[image_state_key]
+    if pasted_images:
+        st.caption(f"붙여넣은 이미지 {len(pasted_images)}개")
+        with st.expander("붙여넣은 이미지"):
+            for image in pasted_images:
+                st.write(image["name"])
+        if st.button(
+            "붙여넣은 이미지 지우기",
+            key=clear_key,
+            width="stretch",
+        ):
+            st.session_state[image_state_key] = []
+            st.rerun()
+
+    return list(st.session_state[image_state_key])
+
+
+def tileset_guide_size(tile_size: int, gap: int, margin: int) -> tuple[int, int]:
+    columns = max(len(row) for row in TILESET_GUIDE_LAYOUT)
+    rows = len(TILESET_GUIDE_LAYOUT)
+    return (
+        margin * 2 + columns * tile_size + (columns - 1) * gap,
+        margin * 2 + rows * tile_size + (rows - 1) * gap,
+    )
+
+
+def tileset_guide_specs(
+    tile_size: int,
+    gap: int,
+    margin: int,
+) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    for row_index, row in enumerate(TILESET_GUIDE_LAYOUT):
+        for column_index, (code, file_stem, description) in enumerate(row):
+            x0 = margin + column_index * (tile_size + gap)
+            y0 = margin + row_index * (tile_size + gap)
+            specs.append(
+                {
+                    "code": code,
+                    "file_stem": file_stem,
+                    "description": description,
+                    "row": row_index + 1,
+                    "column": column_index + 1,
+                    "box": (x0, y0, x0 + tile_size, y0 + tile_size),
+                }
+            )
+    return specs
+
+
+def tileset_guide_table(
+    tile_size: int,
+    gap: int,
+    margin: int,
+) -> list[dict[str, Any]]:
+    rows = []
+    for spec in tileset_guide_specs(tile_size, gap, margin):
+        x0, y0, x1, y1 = spec["box"]
+        rows.append(
+            {
+                "코드": spec["code"],
+                "파일": f"{spec['file_stem']}.png",
+                "설명": spec["description"],
+                "행": spec["row"],
+                "열": spec["column"],
+                "박스": f"({x0}, {y0})-({x1}, {y1})",
+            }
+        )
+    return rows
+
+
+@st.cache_data(show_spinner=False)
+def build_tileset_guide_background(
+    tile_size: int,
+    gap: int,
+    margin: int,
+    line_width: int,
+):
+    width, height = tileset_guide_size(tile_size, gap, margin)
+    if width > MAX_OUTPUT_SIZE or height > MAX_OUTPUT_SIZE:
+        raise ValueError(
+            f"가이드 크기가 최대 {MAX_OUTPUT_SIZE}px를 넘습니다: {width}x{height}px"
+        )
+
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    columns = max(len(row) for row in TILESET_GUIDE_LAYOUT)
+    rows = len(TILESET_GUIDE_LAYOUT)
+    line_color = (255, 75, 75, 230)
+
+    for column in range(columns + 1):
+        x = min(margin + column * (tile_size + gap), width - 1)
+        draw.line((x, 0, x, height - 1), fill=line_color, width=line_width)
+
+    for row in range(rows + 1):
+        y = min(margin + row * (tile_size + gap), height - 1)
+        draw.line((0, y, width - 1, y), fill=line_color, width=line_width)
+
+    return {
+        "png_bytes": image_to_png_bytes(image),
+        "size": image.size,
+        "tiles": tileset_guide_table(tile_size, gap, margin),
+    }
+
+
+@st.cache_data(show_spinner=False)
+def slice_tileset_guide_image(
+    image_bytes: bytes,
+    tile_size: int,
+    gap: int,
+    margin: int,
+    file_prefix: str,
+    skip_transparent_tiles: bool,
+):
+    source = load_image(image_bytes)
+    expected_width, expected_height = tileset_guide_size(tile_size, gap, margin)
+    if source.width < expected_width or source.height < expected_height:
+        raise ValueError(
+            "입력 이미지가 현재 가이드 설정보다 작습니다: "
+            f"입력={source.width}x{source.height}px, "
+            f"필요={expected_width}x{expected_height}px"
+        )
+
+    prefix = safe_stem(file_prefix)
+    tiles = []
+    for spec in tileset_guide_specs(tile_size, gap, margin):
+        tile = source.crop(spec["box"])
+        if skip_transparent_tiles and tile.getchannel("A").getbbox() is None:
+            continue
+
+        file_name = f"{prefix}_{spec['file_stem']}.png"
+        png_bytes = image_to_png_bytes(tile)
+        tiles.append(
+            {
+                "code": spec["code"],
+                "file": file_name,
+                "description": spec["description"],
+                "size": f"{tile.width}x{tile.height}",
+                "png_bytes": png_bytes,
+                "preview_bytes": checkerboard_preview(tile),
+            }
+        )
+
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for tile in tiles:
+            archive.writestr(tile["file"], tile["png_bytes"])
+
+    return {
+        "tiles": tiles,
+        "zip_bytes": zip_buffer.getvalue(),
+        "source_size": source.size,
+        "expected_size": (expected_width, expected_height),
+    }
 
 
 def render_preview_styles() -> None:
@@ -353,6 +649,118 @@ def process_sprite_sheet(
         }
         for component in components
     ]
+
+
+@st.cache_data(show_spinner=False)
+def build_combined_sprite_sheet(
+    image_payloads: tuple[tuple[str, bytes], ...],
+    scale_factor: float,
+    gap: int,
+    resampling: str,
+):
+    images: list[Image.Image] = []
+    for file_name, image_bytes in image_payloads:
+        image = load_image(image_bytes)
+        images.append(image)
+
+    result = build_square_sprite_sheet(
+        images,
+        scale=float(scale_factor),
+        gap=int(gap),
+        resampling=resampling,
+        max_dimension=MAX_OUTPUT_SIZE,
+    )
+    placements = []
+    for (file_name, _), placement in zip(
+        image_payloads,
+        result.placements,
+        strict=True,
+    ):
+        paste_x0, paste_y0, paste_x1, paste_y1 = placement.paste_box
+        cell_x0, cell_y0, cell_x1, cell_y1 = placement.cell_box
+        placements.append(
+            {
+                "index": placement.index + 1,
+                "file": file_name,
+                "source": f"{placement.source_size[0]}x{placement.source_size[1]}",
+                "cell": f"({cell_x0}, {cell_y0})-({cell_x1}, {cell_y1})",
+                "paste": f"({paste_x0}, {paste_y0})-({paste_x1}, {paste_y1})",
+            }
+        )
+
+    return {
+        "png_bytes": result.png_bytes,
+        "preview_bytes": checkerboard_preview(result.image),
+        "unscaled_size": result.unscaled_size,
+        "scaled_size": result.scaled_size,
+        "cell_size": result.cell_size,
+        "columns": result.columns,
+        "rows": result.rows,
+        "gap": result.gap,
+        "scale": result.scale,
+        "placements": placements,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def recover_sprite_sheet(
+    image_bytes: bytes,
+    source_name: str,
+    scale_factor: float,
+    alpha_threshold: int,
+    min_area: int,
+    resampling: str,
+):
+    source = load_image(image_bytes)
+    scaled_size = (
+        max(1, round(source.width * scale_factor)),
+        max(1, round(source.height * scale_factor)),
+    )
+    if scaled_size[0] > MAX_OUTPUT_SIZE or scaled_size[1] > MAX_OUTPUT_SIZE:
+        raise ValueError(
+            f"스케일 적용 후 최대 크기 {MAX_OUTPUT_SIZE}px를 넘습니다: "
+            f"{scaled_size[0]}x{scaled_size[1]}px"
+        )
+
+    scaled = source
+    if scaled.size != scaled_size:
+        scaled = source.resize(scaled_size, resampling_filter(resampling))
+
+    components = extract_connected_components(
+        scaled,
+        alpha_threshold=alpha_threshold,
+        min_area=min_area,
+    )
+    prefix = safe_stem(source_name)
+    sprites = []
+    for index, component in enumerate(components, start=1):
+        file_name = f"{prefix}_sprite_{index:02d}.png"
+        png_bytes = component.png_bytes
+        sprites.append(
+            {
+                "index": index,
+                "file": file_name,
+                "bbox": component.bbox,
+                "area": component.area,
+                "size": component.image.size,
+                "png_bytes": png_bytes,
+                "preview_bytes": checkerboard_preview(component.image),
+            }
+        )
+
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for sprite in sprites:
+            archive.writestr(sprite["file"], sprite["png_bytes"])
+
+    return {
+        "scaled_png_bytes": image_to_png_bytes(scaled),
+        "scaled_preview_bytes": checkerboard_preview(scaled),
+        "source_size": source.size,
+        "scaled_size": scaled.size,
+        "sprites": sprites,
+        "zip_bytes": zip_buffer.getvalue(),
+    }
 
 
 @st.cache_data(show_spinner=False)
@@ -946,171 +1354,624 @@ def render_image_card(item: dict[str, Any]) -> None:
                 st.success(f"저장됨: {output_path}")
 
 
+def render_cut_fit_tab() -> None:
+    upload_cols = st.columns([1.4, 1], vertical_alignment="top")
+    with upload_cols[0]:
+        uploaded_files = st.file_uploader(
+            "이미지 업로드",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
+            key="cut_fit_uploads",
+        )
+    with upload_cols[1]:
+        pasted_images = render_clipboard_upload(
+            component_key="cut_fit_clipboard_image",
+            clear_key="cut_fit_clear_clipboard_images",
+        )
+
+    sprite_sheet_mode = st.toggle(
+        "스프라이트 시트 분리",
+        value=False,
+        help="업로드 이미지를 배경 제거하거나 원본 alpha 기준으로 연결되지 않은 영역을 각각의 스프라이트로 분리합니다.",
+    )
+
+    sheet_settings: dict[str, Any] = {}
+    if sprite_sheet_mode:
+        with st.container(border=True):
+            sheet_cols = st.columns(
+                [1.5, 1.2, 0.9, 0.9, 1],
+                vertical_alignment="bottom",
+            )
+            with sheet_cols[0]:
+                sheet_settings["model_name"] = st.selectbox(
+                    "시트 모델",
+                    options=list(MODEL_OPTIONS.keys()),
+                    format_func=lambda value: MODEL_OPTIONS[value],
+                    key="sheet_model_name",
+                    help="모델 선택하지 않음은 배경 제거 없이 원본 alpha 연결 영역을 분리합니다.",
+                )
+                sheet_model_disabled = sheet_settings["model_name"] == MODEL_NONE
+            with sheet_cols[1]:
+                sheet_settings["alpha_threshold"] = st.slider(
+                    "시트 Alpha",
+                    min_value=0,
+                    max_value=254,
+                    value=16,
+                    key="sheet_alpha_threshold",
+                )
+            with sheet_cols[2]:
+                sheet_settings["preserve_interior"] = st.checkbox(
+                    "내부 복원",
+                    value=True,
+                    key="sheet_preserve_interior",
+                    disabled=sheet_model_disabled,
+                )
+            with sheet_cols[3]:
+                sheet_settings["post_process_mask"] = st.checkbox(
+                    "마스크",
+                    value=True,
+                    key="sheet_post_process_mask",
+                    disabled=sheet_model_disabled,
+                )
+            with sheet_cols[4]:
+                sheet_settings["min_area"] = int(
+                    st.number_input(
+                        "최소 영역",
+                        min_value=1,
+                        max_value=1_000_000,
+                        value=64,
+                        step=1,
+                        key="sheet_min_area",
+                    )
+                )
+
+    image_sources = [
+        {
+            "name": uploaded_file.name,
+            "bytes": uploaded_file.getvalue(),
+            "source": "upload",
+        }
+        for uploaded_file in uploaded_files or []
+    ]
+    image_sources.extend(pasted_images)
+
+    if not image_sources:
+        st.info("PNG, JPG, JPEG, WebP 이미지를 업로드하거나 클립보드에서 붙여넣으세요.")
+        return
+
+    uploaded_items: list[dict[str, Any]] = []
+    for index, image_source in enumerate(image_sources):
+        image_bytes = image_source["bytes"]
+        image_name = image_source["name"]
+        digest = hashlib.sha1(image_bytes).hexdigest()
+        if sprite_sheet_mode:
+            try:
+                with st.spinner(f"{image_name} 스프라이트 분리 중..."):
+                    sprites = process_sprite_sheet(
+                        image_bytes,
+                        sheet_settings["alpha_threshold"],
+                        sheet_settings["model_name"],
+                        sheet_settings["preserve_interior"],
+                        sheet_settings["post_process_mask"],
+                        sheet_settings["min_area"],
+                    )
+            except Exception as exc:
+                st.error(f"{image_name}: {exc}")
+                continue
+
+            if not sprites:
+                st.warning(f"{image_name}: 분리된 스프라이트가 없습니다.")
+                continue
+
+            for sprite_index, sprite in enumerate(sprites, start=1):
+                sprite_bytes = sprite["png_bytes"]
+                sprite_digest = hashlib.sha1(sprite_bytes).hexdigest()
+                image_id = f"{digest[:12]}_{index}_sprite_{sprite_index}_{sprite_digest[:8]}"
+                item = {
+                    "id": image_id,
+                    "digest": sprite_digest,
+                    "name": f"{safe_stem(image_name)}_sprite_{sprite_index:02d}.png",
+                    "bytes": sprite_bytes,
+                    "kind": "sprite",
+                    "parent_name": image_name,
+                    "sprite_index": sprite_index,
+                    "sheet_bbox": sprite["bbox"],
+                    "component_area": sprite["area"],
+                }
+                uploaded_items.append(item)
+                initialize_image_state(image_id)
+        else:
+            image_id = f"{digest[:16]}_{index}"
+            item = {
+                "id": image_id,
+                "digest": digest,
+                "name": image_name,
+                "bytes": image_bytes,
+                "kind": "image",
+            }
+            uploaded_items.append(item)
+            initialize_image_state(image_id)
+
+    if not uploaded_items:
+        return
+
+    active_ids = {item["id"] for item in uploaded_items}
+    prune_image_state(active_ids)
+
+    st.caption(f"{len(uploaded_items)}개 이미지 업로드됨")
+
+    for uploaded_item in uploaded_items:
+        render_image_card(uploaded_item)
+
+    st.divider()
+    if st.button("모든 이미지 저장", type="primary", use_container_width=True):
+        saved_paths: list[Path] = []
+        errors: list[str] = []
+        progress = st.progress(0, text="일괄 저장 준비 중...")
+
+        for index, item in enumerate(uploaded_items, start=1):
+            progress.progress(
+                (index - 1) / len(uploaded_items),
+                text=f"{item['name']} 처리 중...",
+            )
+            try:
+                _, _, _, item_output, _, _ = process_item_output(item)
+                final_width, final_height = item_output["size"]
+                saved_paths.append(
+                    save_output(
+                        item,
+                        item_output["png_bytes"],
+                        final_width,
+                        final_height,
+                    )
+                )
+            except Exception as exc:
+                errors.append(f"{item['name']}: {exc}")
+
+        progress.progress(1.0, text="일괄 저장 완료")
+
+        if saved_paths:
+            st.success(f"{len(saved_paths)}개 이미지를 {OUTPUT_DIR}에 저장했습니다.")
+            with st.expander("저장된 파일"):
+                for path in saved_paths:
+                    st.write(str(path))
+
+        if errors:
+            st.error("일부 이미지를 저장하지 못했습니다.")
+            for error in errors:
+                st.write(error)
+
+
+def render_sprite_sheet_make_mode() -> None:
+    upload_cols = st.columns([1.4, 1], vertical_alignment="top")
+    with upload_cols[0]:
+        sheet_files = st.file_uploader(
+            "스프라이트 시트용 이미지 업로드",
+            type=["png", "jpg", "jpeg", "webp"],
+            accept_multiple_files=True,
+            key="sprite_sheet_builder_uploads",
+            help="기존 이미지 편집 탭과 별개의 업로드 목록입니다.",
+        )
+    with upload_cols[1]:
+        pasted_images = render_clipboard_upload(
+            component_key="sprite_sheet_builder_clipboard_image",
+            clear_key="sprite_sheet_builder_clear_clipboard_images",
+            image_state_key=SPRITE_SHEET_BUILDER_CLIPBOARD_IMAGE_STATE_KEY,
+            seen_state_key=SPRITE_SHEET_BUILDER_CLIPBOARD_SEEN_STATE_KEY,
+        )
+
+    uploaded_payloads = [
+        (sheet_file.name, sheet_file.getvalue()) for sheet_file in sheet_files or []
+    ]
+    pasted_payloads = [(image["name"], image["bytes"]) for image in pasted_images]
+    image_payloads = tuple(uploaded_payloads + pasted_payloads)
+
+    if not image_payloads:
+        st.info("스프라이트 시트로 합칠 이미지를 업로드하거나 클립보드에서 붙여넣으세요.")
+        return
+
+    control_cols = st.columns([1, 1, 1.6], vertical_alignment="bottom")
+    with control_cols[0]:
+        scale_factor = st.number_input(
+            "Scale",
+            min_value=0.05,
+            max_value=16.0,
+            value=1.0,
+            step=0.05,
+            format="%.2f",
+            key="sprite_sheet_builder_scale",
+            help="완성된 스프라이트 시트 전체를 몇 배로 조정할지 정합니다.",
+        )
+    with control_cols[1]:
+        gap = int(
+            st.number_input(
+                "간격(px)",
+                min_value=0,
+                max_value=512,
+                value=0,
+                step=1,
+                key="sprite_sheet_builder_gap",
+                help="각 이미지 셀 사이에 넣을 투명 간격입니다.",
+            )
+        )
+    with control_cols[2]:
+        resampling = st.segmented_control(
+            "스케일 방식",
+            options=list(SPRITE_SHEET_RESAMPLE_OPTIONS.keys()),
+            format_func=lambda value: SPRITE_SHEET_RESAMPLE_OPTIONS[value],
+            default="nearest",
+            key="sprite_sheet_builder_resampling",
+            width="stretch",
+        )
+    if resampling is None:
+        resampling = "nearest"
+
+    try:
+        with st.spinner("스프라이트 시트 생성 중..."):
+            sheet = build_combined_sprite_sheet(
+                image_payloads,
+                float(scale_factor),
+                gap,
+                str(resampling),
+            )
+    except Exception as exc:
+        st.error(str(exc))
+        return
+
+    scaled_width, scaled_height = sheet["scaled_size"]
+    unscaled_width, unscaled_height = sheet["unscaled_size"]
+    cell_width, cell_height = sheet["cell_size"]
+
+    metric_cols = st.columns(4)
+    with metric_cols[0]:
+        st.metric("이미지", f"{len(image_payloads)}개")
+    with metric_cols[1]:
+        st.metric("격자", f"{sheet['columns']} x {sheet['rows']}")
+    with metric_cols[2]:
+        st.metric("셀", f"{cell_width} x {cell_height}px")
+    with metric_cols[3]:
+        st.metric("최종", f"{scaled_width} x {scaled_height}px")
+
+    st.caption(
+        f"원본 시트={unscaled_width}x{unscaled_height}px · "
+        f"scale={sheet['scale']:.2f}x · "
+        f"간격={sheet['gap']}px · "
+        f"방식={SPRITE_SHEET_RESAMPLE_OPTIONS[str(resampling)]}"
+    )
+    render_fixed_preview(sheet["preview_bytes"], alt="sprite sheet output")
+
+    output_name = safe_output_name("sprite_sheet.png", scaled_width, scaled_height)
+    action_cols = st.columns([1, 1, 2], vertical_alignment="bottom")
+    with action_cols[0]:
+        st.download_button(
+            "PNG 다운로드",
+            data=sheet["png_bytes"],
+            file_name=output_name,
+            mime="image/png",
+            key="sprite_sheet_builder_download",
+            use_container_width=True,
+        )
+    with action_cols[1]:
+        if st.button(
+            "저장",
+            key="sprite_sheet_builder_save",
+            use_container_width=True,
+        ):
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            output_path = unique_output_path(OUTPUT_DIR / output_name)
+            output_path.write_bytes(sheet["png_bytes"])
+            st.success(f"저장됨: {output_path}")
+
+    with st.expander("배치 정보"):
+        st.dataframe(sheet["placements"], use_container_width=True, hide_index=True)
+
+
+def render_sprite_sheet_recover_mode() -> None:
+    sheet_file = st.file_uploader(
+        "복구할 스프라이트 시트 업로드",
+        type=["png", "jpg", "jpeg", "webp"],
+        key="sprite_sheet_recover_upload",
+    )
+    if sheet_file is None:
+        st.info("투명 배경 스프라이트 시트를 업로드하세요.")
+        return
+
+    control_cols = st.columns([1, 1, 1, 1.3], vertical_alignment="bottom")
+    with control_cols[0]:
+        scale_factor = st.number_input(
+            "축소 Scale",
+            min_value=0.05,
+            max_value=1.0,
+            value=0.5,
+            step=0.05,
+            format="%.2f",
+            key="sprite_sheet_recover_scale",
+            help="전체 시트를 먼저 축소한 뒤 스프라이트를 분리합니다.",
+        )
+    with control_cols[1]:
+        alpha_threshold = int(
+            st.slider(
+                "Alpha",
+                min_value=0,
+                max_value=254,
+                value=16,
+                key="sprite_sheet_recover_alpha_threshold",
+            )
+        )
+    with control_cols[2]:
+        min_area = int(
+            st.number_input(
+                "최소 영역",
+                min_value=1,
+                max_value=1_000_000,
+                value=16,
+                step=1,
+                key="sprite_sheet_recover_min_area",
+            )
+        )
+    with control_cols[3]:
+        resampling = st.segmented_control(
+            "스케일 방식",
+            options=list(SPRITE_SHEET_RESAMPLE_OPTIONS.keys()),
+            format_func=lambda value: SPRITE_SHEET_RESAMPLE_OPTIONS[value],
+            default="nearest",
+            key="sprite_sheet_recover_resampling",
+            width="stretch",
+        )
+    if resampling is None:
+        resampling = "nearest"
+
+    try:
+        with st.spinner("스프라이트 시트 복구 중..."):
+            recovered = recover_sprite_sheet(
+                sheet_file.getvalue(),
+                sheet_file.name,
+                float(scale_factor),
+                alpha_threshold,
+                min_area,
+                str(resampling),
+            )
+    except Exception as exc:
+        st.error(str(exc))
+        return
+
+    source_width, source_height = recovered["source_size"]
+    scaled_width, scaled_height = recovered["scaled_size"]
+    sprites = recovered["sprites"]
+
+    metric_cols = st.columns(4)
+    with metric_cols[0]:
+        st.metric("원본", f"{source_width} x {source_height}px")
+    with metric_cols[1]:
+        st.metric("축소", f"{scaled_width} x {scaled_height}px")
+    with metric_cols[2]:
+        st.metric("Scale", f"{float(scale_factor):.2f}x")
+    with metric_cols[3]:
+        st.metric("분리", f"{len(sprites)}개")
+
+    render_fixed_preview(recovered["scaled_preview_bytes"], alt="recovered sprite sheet")
+
+    safe_name = safe_stem(sheet_file.name)
+    action_cols = st.columns([1, 1, 2], vertical_alignment="bottom")
+    with action_cols[0]:
+        st.download_button(
+            "축소 시트 PNG",
+            data=recovered["scaled_png_bytes"],
+            file_name=f"{safe_name}_scaled_{scaled_width}x{scaled_height}.png",
+            mime="image/png",
+            key="sprite_sheet_recover_scaled_download",
+            width="stretch",
+        )
+    with action_cols[1]:
+        st.download_button(
+            "분리 PNG ZIP",
+            data=recovered["zip_bytes"],
+            file_name=f"{safe_name}_sprites.zip",
+            mime="application/zip",
+            key="sprite_sheet_recover_zip_download",
+            width="stretch",
+            disabled=not sprites,
+        )
+
+    if not sprites:
+        st.warning("분리된 스프라이트가 없습니다.")
+        return
+
+    with st.expander("분리 정보"):
+        st.dataframe(
+            [
+                {
+                    "index": sprite["index"],
+                    "file": sprite["file"],
+                    "size": f"{sprite['size'][0]}x{sprite['size'][1]}",
+                    "bbox": sprite["bbox"],
+                    "area": sprite["area"],
+                }
+                for sprite in sprites
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with st.expander("개별 스프라이트"):
+        preview_cols = st.columns(4)
+        for index, sprite in enumerate(sprites):
+            with preview_cols[index % 4]:
+                st.caption(sprite["file"])
+                st.image(sprite["preview_bytes"], width=96)
+                st.download_button(
+                    "PNG",
+                    data=sprite["png_bytes"],
+                    file_name=sprite["file"],
+                    mime="image/png",
+                    key=f"sprite_sheet_recover_download_{sprite['file']}",
+                    width="stretch",
+                )
+
+
+def render_sprite_sheet_builder_tab() -> None:
+    mode = st.segmented_control(
+        "모드",
+        options=["make", "recover"],
+        format_func=lambda value: {
+            "make": "스프라이트 시트 만들기",
+            "recover": "스프라이트 시트 복구하기",
+        }[value],
+        default="make",
+        key="sprite_sheet_builder_mode",
+        width="stretch",
+    )
+    if mode == "recover":
+        render_sprite_sheet_recover_mode()
+    else:
+        render_sprite_sheet_make_mode()
+
+
+def render_tileset_guide_tab() -> None:
+    gap = 0
+    margin = 0
+    control_cols = st.columns([1, 1.2, 1, 1.8], vertical_alignment="bottom")
+    with control_cols[0]:
+        tile_size = int(
+            st.number_input(
+                "타일 크기(px)",
+                min_value=16,
+                max_value=256,
+                value=64,
+                step=8,
+                key="tileset_guide_tile_size",
+            )
+        )
+    with control_cols[1]:
+        file_prefix = st.text_input(
+            "파일 접두어",
+            value="ground",
+            key="tileset_guide_file_prefix",
+        )
+    with control_cols[2]:
+        line_width = int(
+            st.number_input(
+                "가이드선(px)",
+                min_value=1,
+                max_value=6,
+                value=1,
+                step=1,
+                key="tileset_guide_line_width",
+            )
+        )
+
+    try:
+        guide = build_tileset_guide_background(tile_size, gap, margin, line_width)
+    except Exception as exc:
+        st.error(str(exc))
+        return
+
+    guide_width, guide_height = guide["size"]
+    metric_cols = st.columns(4)
+    with metric_cols[0]:
+        st.metric("타일", f"{len(guide['tiles'])}개")
+    with metric_cols[1]:
+        st.metric("크기", f"{tile_size} x {tile_size}px")
+    with metric_cols[2]:
+        st.metric("격자", "3 x 3")
+    with metric_cols[3]:
+        st.metric("가이드", f"{guide_width} x {guide_height}px")
+
+    render_fixed_preview(guide["png_bytes"], alt="tileset guide")
+
+    guide_file_name = f"{safe_stem(file_prefix)}_tileset_guide_{tile_size}px.png"
+    download_cols = st.columns([1, 1, 2], vertical_alignment="bottom")
+    with download_cols[0]:
+        st.download_button(
+            "가이드 PNG 다운로드",
+            data=guide["png_bytes"],
+            file_name=guide_file_name,
+            mime="image/png",
+            key="tileset_guide_download",
+            width="stretch",
+        )
+    with download_cols[1]:
+        with st.expander("타일 박스"):
+            st.dataframe(guide["tiles"], use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    slicer_cols = st.columns([1.4, 1], vertical_alignment="bottom")
+    with slicer_cols[0]:
+        guide_input_file = st.file_uploader(
+            "완성된 가이드 이미지 업로드",
+            type=["png", "jpg", "jpeg", "webp"],
+            key="tileset_guide_input",
+        )
+    with slicer_cols[1]:
+        skip_transparent_tiles = st.checkbox(
+            "완전 투명 타일 제외",
+            value=False,
+            key="tileset_guide_skip_transparent_tiles",
+        )
+
+    if guide_input_file is None:
+        st.info("완성된 가이드 이미지를 업로드하면 각 타일 박스만 잘라 PNG로 내보냅니다.")
+        return
+
+    try:
+        sliced = slice_tileset_guide_image(
+            guide_input_file.getvalue(),
+            tile_size,
+            gap,
+            margin,
+            file_prefix,
+            skip_transparent_tiles,
+        )
+    except Exception as exc:
+        st.error(str(exc))
+        return
+
+    source_width, source_height = sliced["source_size"]
+    expected_width, expected_height = sliced["expected_size"]
+    st.caption(
+        f"입력={source_width}x{source_height}px · "
+        f"가이드 기준={expected_width}x{expected_height}px · "
+        f"추출={len(sliced['tiles'])}개"
+    )
+
+    zip_name = f"{safe_stem(file_prefix)}_tiles.zip"
+    st.download_button(
+        "타일 PNG ZIP 다운로드",
+        data=sliced["zip_bytes"],
+        file_name=zip_name,
+        mime="application/zip",
+        key="tileset_guide_zip_download",
+        width="stretch",
+    )
+
+    with st.expander("개별 PNG"):
+        preview_cols = st.columns(4)
+        for index, tile in enumerate(sliced["tiles"]):
+            with preview_cols[index % 4]:
+                st.caption(f"{tile['code']} · {tile['file']}")
+                st.image(tile["preview_bytes"], width=96)
+                st.download_button(
+                    "PNG",
+                    data=tile["png_bytes"],
+                    file_name=tile["file"],
+                    mime="image/png",
+                    key=f"tileset_guide_download_{tile['file']}",
+                    width="stretch",
+                )
+
+
 st.set_page_config(page_title="Image Cut Fit", layout="wide")
 render_preview_styles()
 
 st.title("Image Cut Fit")
 
-uploaded_files = st.file_uploader(
-    "이미지 업로드",
-    type=["png", "jpg", "jpeg", "webp"],
-    accept_multiple_files=True,
+cut_fit_tab, sprite_sheet_builder_tab, tileset_guide_tab = st.tabs(
+    ["이미지 컷/핏", "스프라이트 시트 만들기", "타일셋 가이드"]
 )
-
-sprite_sheet_mode = st.toggle(
-    "스프라이트 시트 분리",
-    value=False,
-    help="업로드 이미지를 배경 제거하거나 원본 alpha 기준으로 연결되지 않은 영역을 각각의 스프라이트로 분리합니다.",
-)
-
-sheet_settings: dict[str, Any] = {}
-if sprite_sheet_mode:
-    with st.container(border=True):
-        sheet_cols = st.columns([1.5, 1.2, 0.9, 0.9, 1], vertical_alignment="bottom")
-        with sheet_cols[0]:
-            sheet_settings["model_name"] = st.selectbox(
-                "시트 모델",
-                options=list(MODEL_OPTIONS.keys()),
-                format_func=lambda value: MODEL_OPTIONS[value],
-                key="sheet_model_name",
-                help="모델 선택하지 않음은 배경 제거 없이 원본 alpha 연결 영역을 분리합니다.",
-            )
-            sheet_model_disabled = sheet_settings["model_name"] == MODEL_NONE
-        with sheet_cols[1]:
-            sheet_settings["alpha_threshold"] = st.slider(
-                "시트 Alpha",
-                min_value=0,
-                max_value=254,
-                value=16,
-                key="sheet_alpha_threshold",
-            )
-        with sheet_cols[2]:
-            sheet_settings["preserve_interior"] = st.checkbox(
-                "내부 복원",
-                value=True,
-                key="sheet_preserve_interior",
-                disabled=sheet_model_disabled,
-            )
-        with sheet_cols[3]:
-            sheet_settings["post_process_mask"] = st.checkbox(
-                "마스크",
-                value=True,
-                key="sheet_post_process_mask",
-                disabled=sheet_model_disabled,
-            )
-        with sheet_cols[4]:
-            sheet_settings["min_area"] = int(
-                st.number_input(
-                    "최소 영역",
-                    min_value=1,
-                    max_value=1_000_000,
-                    value=64,
-                    step=1,
-                    key="sheet_min_area",
-                )
-            )
-
-if not uploaded_files:
-    st.info("PNG, JPG, JPEG, WebP 이미지를 하나 이상 업로드하세요.")
-    st.stop()
-
-uploaded_items: list[dict[str, Any]] = []
-for index, uploaded_file in enumerate(uploaded_files):
-    image_bytes = uploaded_file.getvalue()
-    digest = hashlib.sha1(image_bytes).hexdigest()
-    if sprite_sheet_mode:
-        try:
-            with st.spinner(f"{uploaded_file.name} 스프라이트 분리 중..."):
-                sprites = process_sprite_sheet(
-                    image_bytes,
-                    sheet_settings["alpha_threshold"],
-                    sheet_settings["model_name"],
-                    sheet_settings["preserve_interior"],
-                    sheet_settings["post_process_mask"],
-                    sheet_settings["min_area"],
-                )
-        except Exception as exc:
-            st.error(f"{uploaded_file.name}: {exc}")
-            continue
-
-        if not sprites:
-            st.warning(f"{uploaded_file.name}: 분리된 스프라이트가 없습니다.")
-            continue
-
-        for sprite_index, sprite in enumerate(sprites, start=1):
-            sprite_bytes = sprite["png_bytes"]
-            sprite_digest = hashlib.sha1(sprite_bytes).hexdigest()
-            image_id = f"{digest[:12]}_{index}_sprite_{sprite_index}_{sprite_digest[:8]}"
-            item = {
-                "id": image_id,
-                "digest": sprite_digest,
-                "name": f"{safe_stem(uploaded_file.name)}_sprite_{sprite_index:02d}.png",
-                "bytes": sprite_bytes,
-                "kind": "sprite",
-                "parent_name": uploaded_file.name,
-                "sprite_index": sprite_index,
-                "sheet_bbox": sprite["bbox"],
-                "component_area": sprite["area"],
-            }
-            uploaded_items.append(item)
-            initialize_image_state(image_id)
-    else:
-        image_id = f"{digest[:16]}_{index}"
-        item = {
-            "id": image_id,
-            "digest": digest,
-            "name": uploaded_file.name,
-            "bytes": image_bytes,
-            "kind": "image",
-        }
-        uploaded_items.append(item)
-        initialize_image_state(image_id)
-
-if not uploaded_items:
-    st.stop()
-
-active_ids = {item["id"] for item in uploaded_items}
-prune_image_state(active_ids)
-
-st.caption(f"{len(uploaded_items)}개 이미지 업로드됨")
-
-for uploaded_item in uploaded_items:
-    render_image_card(uploaded_item)
-
-st.divider()
-if st.button("모든 이미지 저장", type="primary", use_container_width=True):
-    saved_paths: list[Path] = []
-    errors: list[str] = []
-    progress = st.progress(0, text="일괄 저장 준비 중...")
-
-    for index, item in enumerate(uploaded_items, start=1):
-        progress.progress(
-            (index - 1) / len(uploaded_items),
-            text=f"{item['name']} 처리 중...",
-        )
-        try:
-            _, _, _, item_output, item_width, item_height = process_item_output(item)
-            final_width, final_height = item_output["size"]
-            saved_paths.append(
-                save_output(
-                    item,
-                    item_output["png_bytes"],
-                    final_width,
-                    final_height,
-                )
-            )
-        except Exception as exc:
-            errors.append(f"{item['name']}: {exc}")
-
-    progress.progress(1.0, text="일괄 저장 완료")
-
-    if saved_paths:
-        st.success(f"{len(saved_paths)}개 이미지를 {OUTPUT_DIR}에 저장했습니다.")
-        with st.expander("저장된 파일"):
-            for path in saved_paths:
-                st.write(str(path))
-
-    if errors:
-        st.error("일부 이미지를 저장하지 못했습니다.")
-        for error in errors:
-            st.write(error)
+with cut_fit_tab:
+    render_cut_fit_tab()
+with sprite_sheet_builder_tab:
+    render_sprite_sheet_builder_tab()
+with tileset_guide_tab:
+    render_tileset_guide_tab()
