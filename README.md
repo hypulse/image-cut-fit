@@ -12,6 +12,8 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+macOS에서는 `Image Cut Fit.command`를 더블클릭해 실행할 수 있습니다.
+
 `rembg`는 첫 실행 시 모델 파일을 다운로드할 수 있습니다.
 
 ## 탭별 기능
