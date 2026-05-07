@@ -31,8 +31,11 @@ from image_pipeline import (
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 ERASER_COMPONENT_DIR = Path(__file__).parent / "components" / "eraser_canvas"
 CLIPBOARD_IMAGE_COMPONENT_DIR = Path(__file__).parent / "components" / "clipboard_image"
+MANUAL_CROP_COMPONENT_DIR = Path(__file__).parent / "components" / "manual_crop_editor"
 CLIPBOARD_IMAGE_STATE_KEY = "cut_fit_clipboard_images"
 CLIPBOARD_SEEN_STATE_KEY = "cut_fit_clipboard_seen_ids"
+MANUAL_TRANSFORM_CLIPBOARD_IMAGE_STATE_KEY = "manual_transform_clipboard_images"
+MANUAL_TRANSFORM_CLIPBOARD_SEEN_STATE_KEY = "manual_transform_clipboard_seen_ids"
 SPRITE_SHEET_BUILDER_CLIPBOARD_IMAGE_STATE_KEY = (
     "sprite_sheet_builder_clipboard_images"
 )
@@ -95,6 +98,10 @@ eraser_canvas = components.declare_component(
 clipboard_image = components.declare_component(
     "clipboard_image",
     path=str(CLIPBOARD_IMAGE_COMPONENT_DIR),
+)
+manual_crop_editor = components.declare_component(
+    "manual_crop_editor",
+    path=str(MANUAL_CROP_COMPONENT_DIR),
 )
 
 
@@ -632,6 +639,106 @@ def process_rotation(
     }
 
 
+def normalize_manual_crop_box(
+    crop_box: Any,
+    source_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    source_width, source_height = source_size
+    default_box = (0, 0, source_width, source_height)
+
+    if not isinstance(crop_box, (list, tuple)) or len(crop_box) != 4:
+        return default_box
+
+    try:
+        x0, y0, x1, y1 = [int(round(float(value))) for value in crop_box]
+    except (TypeError, ValueError):
+        return default_box
+
+    x0 = max(0, min(x0, source_width - 1))
+    y0 = max(0, min(y0, source_height - 1))
+    x1 = max(x0 + 1, min(x1, source_width))
+    y1 = max(y0 + 1, min(y1, source_height))
+    return x0, y0, x1, y1
+
+
+@st.cache_data(show_spinner=False)
+def process_manual_transform_source(image_bytes: bytes):
+    source = load_image(image_bytes)
+    return {
+        "png_bytes": image_to_png_bytes(source),
+        "preview_bytes": checkerboard_preview(source),
+        "size": source.size,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def process_manual_transform(
+    image_bytes: bytes,
+    paint_data_url: str,
+    image_erase_mask_data_url: str,
+    crop_box: tuple[int, int, int, int],
+    rotation_degrees: int,
+    output_width: int,
+    output_height: int,
+    resize_mode: str,
+):
+    source = load_image(image_bytes)
+    if image_erase_mask_data_url:
+        erase_mask = Image.open(
+            BytesIO(png_bytes_from_data_url(image_erase_mask_data_url))
+        )
+        source = apply_erase_mask(source, erase_mask)
+
+    if paint_data_url:
+        paint_layer = Image.open(BytesIO(png_bytes_from_data_url(paint_data_url)))
+        paint_layer = paint_layer.convert("RGBA")
+        if paint_layer.size != source.size:
+            paint_layer = paint_layer.resize(source.size, Image.Resampling.LANCZOS)
+        source.alpha_composite(paint_layer)
+
+    normalized_crop_box = normalize_manual_crop_box(crop_box, source.size)
+    cropped = source.crop(normalized_crop_box)
+
+    degrees = float(rotation_degrees)
+    if abs(degrees % 360) < 1e-9:
+        rotated = cropped
+    else:
+        rotated = cropped.rotate(
+            -degrees,
+            expand=True,
+            resample=Image.Resampling.BICUBIC,
+            fillcolor=(0, 0, 0, 0),
+        )
+
+    target_width = int(output_width)
+    target_height = int(output_height)
+    if target_width < 1 or target_height < 1:
+        raise ValueError("출력 가로/세로는 1px 이상이어야 합니다.")
+    if target_width > MAX_OUTPUT_SIZE or target_height > MAX_OUTPUT_SIZE:
+        raise ValueError(
+            f"출력 크기가 최대 {MAX_OUTPUT_SIZE}px를 넘습니다: "
+            f"{target_width}x{target_height}px"
+        )
+
+    output = resize_to_target(
+        rotated,
+        width=target_width,
+        height=target_height,
+        mode=normalize_resize_mode(resize_mode),
+    )
+
+    return {
+        "png_bytes": image_to_png_bytes(output),
+        "preview_bytes": checkerboard_preview(output),
+        "source_size": source.size,
+        "crop_box": normalized_crop_box,
+        "cropped_size": cropped.size,
+        "rotated_size": rotated.size,
+        "resize_mode": normalize_resize_mode(resize_mode),
+        "size": output.size,
+    }
+
+
 @st.cache_data(show_spinner=False)
 def process_sprite_sheet(
     image_bytes: bytes,
@@ -825,6 +932,10 @@ def image_state_key(image_id: str, name: str) -> str:
     return f"image_{image_id}_{name}"
 
 
+def manual_image_state_key(image_id: str, name: str) -> str:
+    return f"manual_image_{image_id}_{name}"
+
+
 def normalize_resize_mode(value: Any) -> str:
     if value in RESIZE_MODE_OPTIONS:
         return str(value)
@@ -869,6 +980,109 @@ def prune_image_state(active_image_ids: set[str]) -> None:
             key.startswith(prefix) for prefix in active_prefixes
         ):
             del st.session_state[key]
+
+
+def initialize_manual_image_state(
+    image_id: str,
+    source_size: tuple[int, int],
+) -> None:
+    defaults: dict[str, Any] = {
+        "crop_box": [0, 0, source_size[0], source_size[1]],
+        "crop_revision": 0,
+        "paint_data_url": "",
+        "paint_revision": 0,
+        "image_erase_mask_data_url": "",
+        "image_erase_revision": 0,
+        "paint_tool": "crop",
+        "paint_color": "#ff4b4b",
+        "paint_brush_size": 24,
+        "editor_zoom": 100,
+        "rotation_degrees": 0,
+        "output_width": source_size[0],
+        "output_height": source_size[1],
+        "resize_mode": "contain_center",
+    }
+
+    for name, value in defaults.items():
+        key = manual_image_state_key(image_id, name)
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+    crop_key = manual_image_state_key(image_id, "crop_box")
+    st.session_state[crop_key] = list(
+        normalize_manual_crop_box(st.session_state[crop_key], source_size)
+    )
+    resize_key = manual_image_state_key(image_id, "resize_mode")
+    st.session_state[resize_key] = normalize_resize_mode(st.session_state[resize_key])
+
+
+def prune_manual_image_state(active_image_ids: set[str]) -> None:
+    active_prefixes = {f"manual_image_{image_id}_" for image_id in active_image_ids}
+    for key in list(st.session_state.keys()):
+        if key.startswith("manual_image_") and not any(
+            key.startswith(prefix) for prefix in active_prefixes
+        ):
+            del st.session_state[key]
+
+
+def manual_image_settings(
+    image_id: str,
+    source_size: tuple[int, int],
+) -> dict[str, Any]:
+    crop_key = manual_image_state_key(image_id, "crop_box")
+    paint_tool_key = manual_image_state_key(image_id, "paint_tool")
+    paint_brush_key = manual_image_state_key(image_id, "paint_brush_size")
+    editor_zoom_key = manual_image_state_key(image_id, "editor_zoom")
+    width_key = manual_image_state_key(image_id, "output_width")
+    height_key = manual_image_state_key(image_id, "output_height")
+    resize_key = manual_image_state_key(image_id, "resize_mode")
+
+    crop_box = normalize_manual_crop_box(st.session_state[crop_key], source_size)
+    st.session_state[crop_key] = list(crop_box)
+
+    paint_tool = str(st.session_state[paint_tool_key])
+    if paint_tool not in {"crop", "brush", "paint_eraser", "image_eraser"}:
+        paint_tool = "crop"
+
+    try:
+        paint_brush_size = int(st.session_state[paint_brush_key])
+    except (TypeError, ValueError):
+        paint_brush_size = 24
+    try:
+        editor_zoom = int(st.session_state[editor_zoom_key])
+    except (TypeError, ValueError):
+        editor_zoom = 100
+
+    try:
+        output_width = int(st.session_state[width_key])
+    except (TypeError, ValueError):
+        output_width = source_size[0]
+    try:
+        output_height = int(st.session_state[height_key])
+    except (TypeError, ValueError):
+        output_height = source_size[1]
+
+    return {
+        "crop_box": crop_box,
+        "paint_data_url": st.session_state[
+            manual_image_state_key(image_id, "paint_data_url")
+        ],
+        "image_erase_mask_data_url": st.session_state[
+            manual_image_state_key(image_id, "image_erase_mask_data_url")
+        ],
+        "paint_tool": paint_tool,
+        "paint_color": st.session_state[
+            manual_image_state_key(image_id, "paint_color")
+        ],
+        "paint_brush_size": max(1, min(256, paint_brush_size)),
+        "editor_zoom": max(50, min(800, editor_zoom)),
+        "rotation_degrees": int(
+            st.session_state[manual_image_state_key(image_id, "rotation_degrees")]
+        ),
+        "output_width": max(1, min(MAX_OUTPUT_SIZE, output_width)),
+        "output_height": max(1, min(MAX_OUTPUT_SIZE, output_height)),
+        "resize_mode": normalize_resize_mode(st.session_state[resize_key]),
+    }
 
 
 def image_settings(image_id: str) -> dict[str, Any]:
@@ -978,6 +1192,38 @@ def reset_erase_mask(image_id: str) -> None:
     revision_key = image_state_key(image_id, "erase_revision")
     st.session_state[mask_key] = ""
     st.session_state[revision_key] = int(st.session_state.get(revision_key, 0)) + 1
+
+
+def reset_manual_crop(image_id: str, source_size: tuple[int, int]) -> None:
+    crop_key = manual_image_state_key(image_id, "crop_box")
+    revision_key = manual_image_state_key(image_id, "crop_revision")
+    st.session_state[crop_key] = [0, 0, source_size[0], source_size[1]]
+    st.session_state[revision_key] = int(st.session_state.get(revision_key, 0)) + 1
+
+
+def reset_manual_paint(image_id: str) -> None:
+    paint_key = manual_image_state_key(image_id, "paint_data_url")
+    revision_key = manual_image_state_key(image_id, "paint_revision")
+    st.session_state[paint_key] = ""
+    st.session_state[revision_key] = int(st.session_state.get(revision_key, 0)) + 1
+
+
+def reset_manual_image_erase(image_id: str) -> None:
+    mask_key = manual_image_state_key(image_id, "image_erase_mask_data_url")
+    revision_key = manual_image_state_key(image_id, "image_erase_revision")
+    st.session_state[mask_key] = ""
+    st.session_state[revision_key] = int(st.session_state.get(revision_key, 0)) + 1
+
+
+def reset_manual_transform(image_id: str, source_size: tuple[int, int]) -> None:
+    reset_manual_crop(image_id, source_size)
+    reset_manual_paint(image_id)
+    reset_manual_image_erase(image_id)
+    st.session_state[manual_image_state_key(image_id, "rotation_degrees")] = 0
+    st.session_state[manual_image_state_key(image_id, "editor_zoom")] = 100
+    st.session_state[manual_image_state_key(image_id, "output_width")] = source_size[0]
+    st.session_state[manual_image_state_key(image_id, "output_height")] = source_size[1]
+    st.session_state[manual_image_state_key(image_id, "resize_mode")] = "contain_center"
 
 
 def render_erase_editor(image_id: str, cropped_png_bytes: bytes) -> None:
@@ -1582,6 +1828,351 @@ def render_cut_fit_tab() -> None:
                 st.write(error)
 
 
+def render_manual_transform_card(item: dict[str, Any]) -> None:
+    source = process_manual_transform_source(item["bytes"])
+    source_size = source["size"]
+    initialize_manual_image_state(item["id"], source_size)
+
+    with st.container(border=True):
+        st.write(f"**{item['name']}**")
+        st.caption(f"id={item['digest'][:8]}")
+
+        rotation_key = manual_image_state_key(item["id"], "rotation_degrees")
+        paint_tool_key = manual_image_state_key(item["id"], "paint_tool")
+        paint_color_key = manual_image_state_key(item["id"], "paint_color")
+        paint_brush_key = manual_image_state_key(item["id"], "paint_brush_size")
+        paint_data_key = manual_image_state_key(item["id"], "paint_data_url")
+        image_erase_mask_key = manual_image_state_key(
+            item["id"],
+            "image_erase_mask_data_url",
+        )
+        editor_zoom_key = manual_image_state_key(item["id"], "editor_zoom")
+        width_key = manual_image_state_key(item["id"], "output_width")
+        height_key = manual_image_state_key(item["id"], "output_height")
+        resize_key = manual_image_state_key(item["id"], "resize_mode")
+
+        control_cols = st.columns(
+            [1.2, 0.75, 0.75, 1.8, 0.75],
+            vertical_alignment="bottom",
+        )
+        with control_cols[0]:
+            st.slider(
+                "각도",
+                min_value=MIN_ROTATION_DEGREES,
+                max_value=MAX_ROTATION_DEGREES,
+                step=1,
+                key=rotation_key,
+                help="양수는 시계 방향, 음수는 반시계 방향으로 회전합니다.",
+                width=CONTROL_WIDTH_LG,
+            )
+        with control_cols[1]:
+            st.number_input(
+                "가로",
+                min_value=1,
+                max_value=MAX_OUTPUT_SIZE,
+                step=1,
+                key=width_key,
+                help="Crop과 회전 후 결과를 배치할 최종 가로 크기입니다.",
+                width=CONTROL_WIDTH_SM,
+            )
+        with control_cols[2]:
+            st.number_input(
+                "세로",
+                min_value=1,
+                max_value=MAX_OUTPUT_SIZE,
+                step=1,
+                key=height_key,
+                help="Crop과 회전 후 결과를 배치할 최종 세로 크기입니다.",
+                width=CONTROL_WIDTH_SM,
+            )
+        with control_cols[3]:
+            st.session_state[resize_key] = normalize_resize_mode(
+                st.session_state.get(resize_key)
+            )
+            st.segmented_control(
+                "리사이즈",
+                options=list(RESIZE_MODE_OPTIONS.keys()),
+                format_func=lambda value: RESIZE_MODE_OPTIONS[value],
+                key=resize_key,
+                help="비율 유지 옵션은 지정 크기 안에 맞춘 뒤 위치를 정합니다. 늘려서 채우기는 비율을 무시합니다.",
+                width="stretch",
+            )
+        with control_cols[4]:
+            st.button(
+                "전체 초기화",
+                key=manual_image_state_key(item["id"], "transform_reset"),
+                on_click=reset_manual_transform,
+                args=(item["id"], source_size),
+                width="stretch",
+            )
+
+        paint_cols = st.columns(
+            [1.8, 0.75, 1, 1, 0.75, 0.75, 0.75],
+            vertical_alignment="bottom",
+        )
+        with paint_cols[0]:
+            st.segmented_control(
+                "도구",
+                options=["crop", "brush", "paint_eraser", "image_eraser"],
+                format_func=lambda value: {
+                    "crop": "Crop",
+                    "brush": "브러시",
+                    "paint_eraser": "그림 지우개",
+                    "image_eraser": "이미지 지우개",
+                }[value],
+                key=paint_tool_key,
+                width="stretch",
+            )
+        with paint_cols[1]:
+            st.color_picker(
+                "색상",
+                key=paint_color_key,
+                disabled=st.session_state[paint_tool_key] != "brush",
+            )
+        with paint_cols[2]:
+            st.slider(
+                "브러시/지우개 크기",
+                min_value=1,
+                max_value=256,
+                step=1,
+                key=paint_brush_key,
+                disabled=st.session_state[paint_tool_key] == "crop",
+                width=CONTROL_WIDTH_LG,
+            )
+        with paint_cols[3]:
+            st.slider(
+                "확대",
+                min_value=50,
+                max_value=800,
+                step=25,
+                format="%d%%",
+                key=editor_zoom_key,
+                width=CONTROL_WIDTH_LG,
+            )
+        with paint_cols[4]:
+            st.button(
+                "Crop 초기화",
+                key=manual_image_state_key(item["id"], "crop_reset"),
+                on_click=reset_manual_crop,
+                args=(item["id"], source_size),
+                width="stretch",
+            )
+        with paint_cols[5]:
+            st.button(
+                "그림 지우기",
+                key=manual_image_state_key(item["id"], "paint_reset"),
+                on_click=reset_manual_paint,
+                args=(item["id"],),
+                disabled=not bool(st.session_state[paint_data_key]),
+                width="stretch",
+            )
+        with paint_cols[6]:
+            st.button(
+                "이미지 복원",
+                key=manual_image_state_key(item["id"], "image_erase_reset"),
+                on_click=reset_manual_image_erase,
+                args=(item["id"],),
+                disabled=not bool(st.session_state[image_erase_mask_key]),
+                width="stretch",
+            )
+
+        settings = manual_image_settings(item["id"], source_size)
+        editor_col, preview_col = st.columns([1.35, 1], vertical_alignment="top")
+
+        with editor_col:
+            crop_key = manual_image_state_key(item["id"], "crop_box")
+            revision_key = manual_image_state_key(item["id"], "crop_revision")
+            paint_revision_key = manual_image_state_key(item["id"], "paint_revision")
+            image_erase_revision_key = manual_image_state_key(
+                item["id"],
+                "image_erase_revision",
+            )
+            component_value = manual_crop_editor(
+                image_data_url=png_data_uri(source["png_bytes"]),
+                crop_box=list(settings["crop_box"]),
+                paint_data_url=settings["paint_data_url"],
+                image_erase_mask_data_url=settings["image_erase_mask_data_url"],
+                tool=settings["paint_tool"],
+                brush_color=settings["paint_color"],
+                brush_size=settings["paint_brush_size"],
+                zoom_factor=settings["editor_zoom"] / 100,
+                key=(
+                    f"{manual_image_state_key(item['id'], 'crop_canvas')}_"
+                    f"{st.session_state[revision_key]}_"
+                    f"{st.session_state[paint_revision_key]}_"
+                    f"{st.session_state[image_erase_revision_key]}"
+                ),
+                default={
+                    "crop_box": list(settings["crop_box"]),
+                    "paint_data_url": settings["paint_data_url"],
+                    "image_erase_mask_data_url": settings[
+                        "image_erase_mask_data_url"
+                    ],
+                },
+            )
+            next_crop_box: tuple[int, int, int, int] | None = None
+            next_paint_data_url: str | None = None
+            next_image_erase_mask_data_url: str | None = None
+            if isinstance(component_value, dict):
+                next_crop_box = normalize_manual_crop_box(
+                    component_value.get("crop_box"),
+                    source_size,
+                )
+                next_paint_data_url = str(component_value.get("paint_data_url") or "")
+                next_image_erase_mask_data_url = str(
+                    component_value.get("image_erase_mask_data_url") or ""
+                )
+            elif isinstance(component_value, (list, tuple)) and len(component_value) == 4:
+                next_crop_box = normalize_manual_crop_box(component_value, source_size)
+
+            should_rerun = False
+            if next_crop_box is not None and next_crop_box != settings["crop_box"]:
+                st.session_state[crop_key] = list(next_crop_box)
+                should_rerun = True
+            if (
+                next_paint_data_url is not None
+                and next_paint_data_url != settings["paint_data_url"]
+            ):
+                st.session_state[paint_data_key] = next_paint_data_url
+                should_rerun = True
+            if (
+                next_image_erase_mask_data_url is not None
+                and next_image_erase_mask_data_url
+                != settings["image_erase_mask_data_url"]
+            ):
+                st.session_state[image_erase_mask_key] = next_image_erase_mask_data_url
+                should_rerun = True
+            if should_rerun:
+                st.rerun()
+
+        settings = manual_image_settings(item["id"], source_size)
+        try:
+            output = process_manual_transform(
+                item["bytes"],
+                settings["paint_data_url"],
+                settings["image_erase_mask_data_url"],
+                settings["crop_box"],
+                settings["rotation_degrees"],
+                settings["output_width"],
+                settings["output_height"],
+                settings["resize_mode"],
+            )
+        except Exception as exc:
+            with preview_col:
+                st.error(str(exc))
+            return
+
+        with preview_col:
+            st.caption("Output")
+            render_fixed_preview(output["preview_bytes"], alt=f"{item['name']} output")
+
+            source_width, source_height = output["source_size"]
+            x0, y0, x1, y1 = output["crop_box"]
+            crop_width, crop_height = output["cropped_size"]
+            rotated_width, rotated_height = output["rotated_size"]
+            final_width, final_height = output["size"]
+            st.caption(
+                f"source={source_width}x{source_height}px · "
+                f"crop=({x0}, {y0}, {x1}, {y1}) · "
+                f"cropped={crop_width}x{crop_height}px · "
+                f"rotated={rotated_width}x{rotated_height}px · "
+                f"target={settings['output_width']}x{settings['output_height']}px · "
+                f"mode={RESIZE_MODE_OPTIONS[settings['resize_mode']]} · "
+                f"paint={'on' if settings['paint_data_url'] else 'off'} · "
+                f"image erase={'on' if settings['image_erase_mask_data_url'] else 'off'} · "
+                f"zoom={settings['editor_zoom']}% · "
+                f"final={final_width}x{final_height}px"
+            )
+
+            output_name = safe_output_name(item["name"], final_width, final_height)
+            action_cols = st.columns([1, 1], vertical_alignment="bottom")
+            with action_cols[0]:
+                st.download_button(
+                    "PNG 다운로드",
+                    data=output["png_bytes"],
+                    file_name=output_name,
+                    mime="image/png",
+                    key=manual_image_state_key(item["id"], "download"),
+                    width="stretch",
+                )
+            with action_cols[1]:
+                if st.button(
+                    "저장",
+                    key=manual_image_state_key(item["id"], "save"),
+                    width="stretch",
+                ):
+                    output_path = save_output(
+                        item,
+                        output["png_bytes"],
+                        final_width,
+                        final_height,
+                    )
+                    st.success(f"저장됨: {output_path}")
+
+
+def render_manual_transform_tab() -> None:
+    with st.container(border=True):
+        upload_cols = st.columns([1.25, 1], vertical_alignment="top")
+        with upload_cols[0]:
+            uploaded_files = st.file_uploader(
+                "이미지 업로드",
+                type=["png", "jpg", "jpeg", "webp"],
+                accept_multiple_files=True,
+                key="manual_transform_uploads",
+                width=CONTROL_WIDTH_XL,
+            )
+        with upload_cols[1]:
+            st.caption("클립보드")
+            pasted_images = render_clipboard_upload(
+                component_key="manual_transform_clipboard_image",
+                image_state_key=MANUAL_TRANSFORM_CLIPBOARD_IMAGE_STATE_KEY,
+                seen_state_key=MANUAL_TRANSFORM_CLIPBOARD_SEEN_STATE_KEY,
+            )
+
+        render_clipboard_image_manager(
+            pasted_images,
+            clear_key="manual_transform_clear_clipboard_images",
+            image_state_key=MANUAL_TRANSFORM_CLIPBOARD_IMAGE_STATE_KEY,
+        )
+
+    image_sources = [
+        {
+            "name": uploaded_file.name,
+            "bytes": uploaded_file.getvalue(),
+            "source": "upload",
+        }
+        for uploaded_file in uploaded_files or []
+    ]
+    image_sources.extend(pasted_images)
+
+    if not image_sources:
+        st.info("PNG, JPG, JPEG, WebP 이미지를 업로드하거나 클립보드에서 붙여넣으세요.")
+        return
+
+    uploaded_items: list[dict[str, Any]] = []
+    for index, image_source in enumerate(image_sources):
+        image_bytes = image_source["bytes"]
+        digest = hashlib.sha1(image_bytes).hexdigest()
+        image_id = f"{digest[:16]}_{index}"
+        uploaded_items.append(
+            {
+                "id": image_id,
+                "digest": digest,
+                "name": image_source["name"],
+                "bytes": image_bytes,
+                "kind": "manual",
+            }
+        )
+
+    active_ids = {item["id"] for item in uploaded_items}
+    prune_manual_image_state(active_ids)
+
+    st.caption(f"{len(uploaded_items)}개 이미지 업로드됨")
+
+    for uploaded_item in uploaded_items:
+        render_manual_transform_card(uploaded_item)
+
+
 def render_sprite_sheet_make_mode() -> None:
     with st.container(border=True):
         upload_cols = st.columns([1.25, 1], vertical_alignment="top")
@@ -2051,11 +2642,18 @@ def render_tileset_guide_tab() -> None:
 
 st.set_page_config(page_title="Image Cut Fit", layout="wide")
 
-cut_fit_tab, sprite_sheet_builder_tab, tileset_guide_tab = st.tabs(
-    ["이미지 컷/핏", "스프라이트 시트 만들기", "타일셋 가이드"]
+cut_fit_tab, manual_transform_tab, sprite_sheet_builder_tab, tileset_guide_tab = st.tabs(
+    [
+        "자동 배경 제거/리사이즈",
+        "수동 자르기/그리기",
+        "스프라이트 시트 생성/복구",
+        "타일셋 가이드/타일 추출",
+    ]
 )
 with cut_fit_tab:
     render_cut_fit_tab()
+with manual_transform_tab:
+    render_manual_transform_tab()
 with sprite_sheet_builder_tab:
     render_sprite_sheet_builder_tab()
 with tileset_guide_tab:

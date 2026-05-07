@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: transparent;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .editor {
+      width: 100%;
+      box-sizing: border-box;
+    }
+
+    .canvas-shell {
+      height: 520px;
+      width: 100%;
+      display: flex;
+      align-items: flex-start;
+      justify-content: flex-start;
+      overflow: auto;
+      border: 1px solid rgba(49, 51, 63, 0.16);
+      border-radius: 6px;
+      background-color: #fafafa;
+      background-image:
+        linear-gradient(45deg, #e1e1e1 25%, transparent 25%),
+        linear-gradient(-45deg, #e1e1e1 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, #e1e1e1 75%),
+        linear-gradient(-45deg, transparent 75%, #e1e1e1 75%);
+      background-size: 24px 24px;
+      background-position: 0 0, 0 12px, 12px -12px, -12px 0;
+    }
+
+    canvas {
+      display: block;
+      width: auto;
+      height: auto;
+      flex: 0 0 auto;
+      touch-action: none;
+      cursor: crosshair;
+    }
+  </style>
+</head>
+<body>
+  <div class="editor">
+    <div class="canvas-shell" id="shell">
+      <canvas id="crop"></canvas>
+    </div>
+  </div>
+
+  <script>
+    const Streamlit = {
+      setComponentReady() {
+        window.parent.postMessage(
+          { isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 },
+          "*",
+        );
+      },
+      setComponentValue(value) {
+        window.parent.postMessage(
+          {
+            isStreamlitMessage: true,
+            type: "streamlit:setComponentValue",
+            value,
+            dataType: "json",
+          },
+          "*",
+        );
+      },
+      setFrameHeight(height) {
+        window.parent.postMessage(
+          { isStreamlitMessage: true, type: "streamlit:setFrameHeight", height },
+          "*",
+        );
+      },
+    };
+
+    const shell = document.getElementById("shell");
+    const canvas = document.getElementById("crop");
+    const ctx = canvas.getContext("2d");
+    const paintCanvas = document.createElement("canvas");
+    const paintCtx = paintCanvas.getContext("2d");
+    const imageEraseCanvas = document.createElement("canvas");
+    const imageEraseCtx = imageEraseCanvas.getContext("2d");
+    const handleSize = 10;
+    const handleHitSize = 18;
+
+    let image = null;
+    let displayScale = 1;
+    let cropBox = null;
+    let latestImageDataUrl = "";
+    let latestPaintDataUrl = "";
+    let latestImageEraseMaskDataUrl = "";
+    let latestZoomFactor = 1;
+    let zoomFactor = 1;
+    let currentTool = "crop";
+    let brushColor = "#ff4b4b";
+    let brushSize = 24;
+    let activeDrag = null;
+    let activePaint = null;
+
+    function loadImage(src) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = reject;
+        img.src = src;
+      });
+    }
+
+    function clamp(value, min, max) {
+      return Math.min(Math.max(value, min), max);
+    }
+
+    function defaultCropBox() {
+      if (!image) return [0, 0, 1, 1];
+      return [0, 0, image.naturalWidth, image.naturalHeight];
+    }
+
+    function normalizeCropBox(box) {
+      if (!image) return defaultCropBox();
+      if (!Array.isArray(box) || box.length !== 4) return defaultCropBox();
+
+      const values = box.map((value) => Number(value));
+      if (values.some((value) => !Number.isFinite(value))) return defaultCropBox();
+
+      const width = image.naturalWidth;
+      const height = image.naturalHeight;
+      const x0 = clamp(values[0], 0, width - 1);
+      const y0 = clamp(values[1], 0, height - 1);
+      const x1 = clamp(values[2], x0 + 1, width);
+      const y1 = clamp(values[3], y0 + 1, height);
+      return [x0, y0, x1, y1];
+    }
+
+    function roundedCropBox(box) {
+      return normalizeCropBox(box).map((value) => Math.round(value));
+    }
+
+    function sameRoundedBox(left, right) {
+      const nextLeft = roundedCropBox(left);
+      const nextRight = roundedCropBox(right);
+      return nextLeft.every((value, index) => value === nextRight[index]);
+    }
+
+    function fitCanvas() {
+      if (!image) return;
+
+      const maxWidth = Math.max(240, shell.clientWidth - 2);
+      const maxHeight = 520;
+      const scale = Math.min(
+        maxWidth / image.naturalWidth,
+        maxHeight / image.naturalHeight,
+      );
+      displayScale = clamp(scale * zoomFactor, 0.02, 32);
+      canvas.width = Math.max(1, Math.round(image.naturalWidth * displayScale));
+      canvas.height = Math.max(1, Math.round(image.naturalHeight * displayScale));
+    }
+
+    function resizeLayerCanvases(width, height) {
+      paintCanvas.width = width;
+      paintCanvas.height = height;
+      paintCtx.clearRect(0, 0, width, height);
+      imageEraseCanvas.width = width;
+      imageEraseCanvas.height = height;
+      imageEraseCtx.clearRect(0, 0, width, height);
+    }
+
+    function drawCheckerboard(targetCtx, width, height) {
+      const square = 16;
+      targetCtx.fillStyle = "#ffffff";
+      targetCtx.fillRect(0, 0, width, height);
+      for (let y = 0; y < height; y += square) {
+        for (let x = 0; x < width; x += square) {
+          targetCtx.fillStyle = ((x / square + y / square) % 2 === 0)
+            ? "#dddddd"
+            : "#f8f8f8";
+          targetCtx.fillRect(x, y, square, square);
+        }
+      }
+    }
+
+    function canvasCropBox() {
+      const [x0, y0, x1, y1] = normalizeCropBox(cropBox);
+      return {
+        x: x0 * displayScale,
+        y: y0 * displayScale,
+        w: (x1 - x0) * displayScale,
+        h: (y1 - y0) * displayScale,
+      };
+    }
+
+    function handlePoints(box) {
+      const x0 = box.x;
+      const y0 = box.y;
+      const x1 = box.x + box.w;
+      const y1 = box.y + box.h;
+      const cx = box.x + box.w / 2;
+      const cy = box.y + box.h / 2;
+      return [
+        { mode: "nw", x: x0, y: y0 },
+        { mode: "n", x: cx, y: y0 },
+        { mode: "ne", x: x1, y: y0 },
+        { mode: "e", x: x1, y: cy },
+        { mode: "se", x: x1, y: y1 },
+        { mode: "s", x: cx, y: y1 },
+        { mode: "sw", x: x0, y: y1 },
+        { mode: "w", x: x0, y: cy },
+      ];
+    }
+
+    function renderCanvas() {
+      if (!image) return;
+
+      const width = canvas.width;
+      const height = canvas.height;
+      const box = canvasCropBox();
+      ctx.clearRect(0, 0, width, height);
+      drawCheckerboard(ctx, width, height);
+
+      const imageLayer = document.createElement("canvas");
+      imageLayer.width = width;
+      imageLayer.height = height;
+      const imageLayerCtx = imageLayer.getContext("2d");
+      imageLayerCtx.drawImage(image, 0, 0, width, height);
+      imageLayerCtx.globalCompositeOperation = "destination-out";
+      imageLayerCtx.drawImage(imageEraseCanvas, 0, 0, width, height);
+      imageLayerCtx.globalCompositeOperation = "source-over";
+
+      ctx.drawImage(imageLayer, 0, 0);
+      ctx.drawImage(paintCanvas, 0, 0, width, height);
+
+      ctx.fillStyle = "rgba(0, 0, 0, 0.38)";
+      ctx.fillRect(0, 0, width, box.y);
+      ctx.fillRect(0, box.y, box.x, box.h);
+      ctx.fillRect(box.x + box.w, box.y, width - box.x - box.w, box.h);
+      ctx.fillRect(0, box.y + box.h, width, height - box.y - box.h);
+
+      ctx.save();
+      ctx.strokeStyle = "#ff4b4b";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(
+        Math.round(box.x) + 0.5,
+        Math.round(box.y) + 0.5,
+        Math.round(box.w),
+        Math.round(box.h),
+      );
+
+      for (const handle of handlePoints(box)) {
+        ctx.fillStyle = "#ffffff";
+        ctx.strokeStyle = "#ff4b4b";
+        ctx.lineWidth = 2;
+        ctx.fillRect(
+          handle.x - handleSize / 2,
+          handle.y - handleSize / 2,
+          handleSize,
+          handleSize,
+        );
+        ctx.strokeRect(
+          handle.x - handleSize / 2,
+          handle.y - handleSize / 2,
+          handleSize,
+          handleSize,
+        );
+      }
+      ctx.restore();
+    }
+
+    function canvasPoint(event) {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: (event.clientX - rect.left) * canvas.width / rect.width,
+        y: (event.clientY - rect.top) * canvas.height / rect.height,
+      };
+    }
+
+    function sourcePoint(point) {
+      return {
+        x: clamp(point.x / displayScale, 0, image.naturalWidth),
+        y: clamp(point.y / displayScale, 0, image.naturalHeight),
+      };
+    }
+
+    function cursorForMode(mode) {
+      if (
+        currentTool === "brush"
+        || currentTool === "paint_eraser"
+        || currentTool === "image_eraser"
+      ) {
+        return "crosshair";
+      }
+      if (mode === "move") return "move";
+      if (mode === "n" || mode === "s") return "ns-resize";
+      if (mode === "e" || mode === "w") return "ew-resize";
+      if (mode === "ne" || mode === "sw") return "nesw-resize";
+      return "nwse-resize";
+    }
+
+    function hitTest(point) {
+      const box = canvasCropBox();
+      for (const handle of handlePoints(box)) {
+        if (
+          Math.abs(point.x - handle.x) <= handleHitSize / 2
+          && Math.abs(point.y - handle.y) <= handleHitSize / 2
+        ) {
+          return handle.mode;
+        }
+      }
+
+      const inside = point.x >= box.x
+        && point.x <= box.x + box.w
+        && point.y >= box.y
+        && point.y <= box.y + box.h;
+      return inside ? "move" : "";
+    }
+
+    function cropBoxForDrag(mode, startCrop, startPoint, currentPoint) {
+      const width = image.naturalWidth;
+      const height = image.naturalHeight;
+      let [x0, y0, x1, y1] = startCrop;
+
+      if (mode === "move") {
+        const cropWidth = x1 - x0;
+        const cropHeight = y1 - y0;
+        const nextX0 = clamp(x0 + currentPoint.x - startPoint.x, 0, width - cropWidth);
+        const nextY0 = clamp(y0 + currentPoint.y - startPoint.y, 0, height - cropHeight);
+        return [nextX0, nextY0, nextX0 + cropWidth, nextY0 + cropHeight];
+      }
+
+      if (mode.includes("w")) x0 = clamp(currentPoint.x, 0, x1 - 1);
+      if (mode.includes("e")) x1 = clamp(currentPoint.x, x0 + 1, width);
+      if (mode.includes("n")) y0 = clamp(currentPoint.y, 0, y1 - 1);
+      if (mode.includes("s")) y1 = clamp(currentPoint.y, y0 + 1, height);
+      return [x0, y0, x1, y1];
+    }
+
+    function hasLayer(targetCanvas, targetCtx) {
+      if (!targetCanvas.width || !targetCanvas.height) return false;
+      const imageData = targetCtx.getImageData(0, 0, targetCanvas.width, targetCanvas.height);
+      const pixels = imageData.data;
+      for (let index = 3; index < pixels.length; index += 4) {
+        if (pixels[index] > 0) return true;
+      }
+      return false;
+    }
+
+    function layerDataUrl(targetCanvas, targetCtx) {
+      return hasLayer(targetCanvas, targetCtx) ? targetCanvas.toDataURL("image/png") : "";
+    }
+
+    function sendEditorValue() {
+      cropBox = roundedCropBox(cropBox);
+      const nextPaintDataUrl = layerDataUrl(paintCanvas, paintCtx);
+      const nextImageEraseMaskDataUrl = layerDataUrl(imageEraseCanvas, imageEraseCtx);
+      latestPaintDataUrl = nextPaintDataUrl;
+      latestImageEraseMaskDataUrl = nextImageEraseMaskDataUrl;
+      Streamlit.setComponentValue({
+        crop_box: cropBox,
+        paint_data_url: nextPaintDataUrl,
+        image_erase_mask_data_url: nextImageEraseMaskDataUrl,
+      });
+      renderCanvas();
+    }
+
+    function drawToolAt(point, lastPoint) {
+      const targetCtx = currentTool === "image_eraser" ? imageEraseCtx : paintCtx;
+      targetCtx.save();
+      targetCtx.lineCap = "round";
+      targetCtx.lineJoin = "round";
+      targetCtx.lineWidth = brushSize;
+
+      if (currentTool === "paint_eraser") {
+        targetCtx.globalCompositeOperation = "destination-out";
+        targetCtx.strokeStyle = "rgba(0, 0, 0, 1)";
+        targetCtx.fillStyle = "rgba(0, 0, 0, 1)";
+      } else if (currentTool === "image_eraser") {
+        targetCtx.globalCompositeOperation = "source-over";
+        targetCtx.strokeStyle = "rgba(255, 255, 255, 1)";
+        targetCtx.fillStyle = "rgba(255, 255, 255, 1)";
+      } else {
+        targetCtx.globalCompositeOperation = "source-over";
+        targetCtx.strokeStyle = brushColor;
+        targetCtx.fillStyle = brushColor;
+      }
+
+      if (lastPoint) {
+        targetCtx.beginPath();
+        targetCtx.moveTo(lastPoint.x, lastPoint.y);
+        targetCtx.lineTo(point.x, point.y);
+        targetCtx.stroke();
+      } else {
+        targetCtx.beginPath();
+        targetCtx.arc(point.x, point.y, brushSize / 2, 0, Math.PI * 2);
+        targetCtx.fill();
+      }
+
+      targetCtx.restore();
+    }
+
+    async function loadLayer(dataUrl, targetCanvas, targetCtx) {
+      targetCtx.clearRect(0, 0, targetCanvas.width, targetCanvas.height);
+      if (!dataUrl) {
+        return;
+      }
+
+      const layerImage = await loadImage(dataUrl);
+      targetCtx.drawImage(layerImage, 0, 0, targetCanvas.width, targetCanvas.height);
+    }
+
+    async function loadPaintLayer(dataUrl) {
+      await loadLayer(dataUrl, paintCanvas, paintCtx);
+      latestPaintDataUrl = dataUrl || "";
+    }
+
+    async function loadImageEraseLayer(dataUrl) {
+      await loadLayer(dataUrl, imageEraseCanvas, imageEraseCtx);
+      latestImageEraseMaskDataUrl = dataUrl || "";
+    }
+
+    canvas.addEventListener("pointerdown", (event) => {
+      if (!image) return;
+
+      const point = canvasPoint(event);
+      if (
+        currentTool === "brush"
+        || currentTool === "paint_eraser"
+        || currentTool === "image_eraser"
+      ) {
+        event.preventDefault();
+        canvas.setPointerCapture(event.pointerId);
+        const nextPoint = sourcePoint(point);
+        activePaint = { lastPoint: null };
+        drawToolAt(nextPoint, null);
+        activePaint.lastPoint = nextPoint;
+        renderCanvas();
+        return;
+      }
+
+      const mode = hitTest(point);
+      if (!mode) return;
+
+      event.preventDefault();
+      canvas.setPointerCapture(event.pointerId);
+      activeDrag = {
+        mode,
+        startCrop: normalizeCropBox(cropBox),
+        startPoint: sourcePoint(point),
+      };
+      canvas.style.cursor = cursorForMode(mode);
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+      if (!image) return;
+
+      const point = canvasPoint(event);
+      if (activePaint) {
+        event.preventDefault();
+        const nextPoint = sourcePoint(point);
+        drawToolAt(nextPoint, activePaint.lastPoint);
+        activePaint.lastPoint = nextPoint;
+        renderCanvas();
+        return;
+      }
+
+      if (!activeDrag) {
+        const mode = hitTest(point);
+        canvas.style.cursor = mode ? cursorForMode(mode) : "crosshair";
+        return;
+      }
+
+      event.preventDefault();
+      cropBox = cropBoxForDrag(
+        activeDrag.mode,
+        activeDrag.startCrop,
+        activeDrag.startPoint,
+        sourcePoint(point),
+      );
+      renderCanvas();
+    });
+
+    function finishDrag(event) {
+      if (activePaint) {
+        event.preventDefault();
+        activePaint = null;
+        sendEditorValue();
+        return;
+      }
+
+      if (!activeDrag) return;
+      event.preventDefault();
+      activeDrag = null;
+      sendEditorValue();
+    }
+
+    canvas.addEventListener("pointerup", finishDrag);
+    canvas.addEventListener("pointercancel", finishDrag);
+    canvas.addEventListener("pointerleave", finishDrag);
+
+    async function render(args) {
+      const nextImageDataUrl = args.image_data_url || "";
+      const nextCropBox = args.crop_box || null;
+      const nextPaintDataUrl = args.paint_data_url || "";
+      const nextImageEraseMaskDataUrl = args.image_erase_mask_data_url || "";
+      const nextZoomFactor = Math.max(0.5, Math.min(8, Number(args.zoom_factor || 1)));
+      const nextTool = args.tool || "crop";
+      currentTool = ["crop", "brush", "paint_eraser", "image_eraser"].includes(nextTool)
+        ? nextTool
+        : "crop";
+      brushColor = args.brush_color || "#ff4b4b";
+      brushSize = Math.max(1, Number(args.brush_size || 24));
+      zoomFactor = nextZoomFactor;
+
+      if (!nextImageDataUrl) {
+        Streamlit.setFrameHeight(524);
+        return;
+      }
+
+      const shouldReloadImage = nextImageDataUrl !== latestImageDataUrl;
+      const shouldUpdateZoom = nextZoomFactor !== latestZoomFactor;
+      if (shouldReloadImage) {
+        image = await loadImage(nextImageDataUrl);
+        latestImageDataUrl = nextImageDataUrl;
+        cropBox = normalizeCropBox(nextCropBox);
+        latestZoomFactor = nextZoomFactor;
+        fitCanvas();
+        resizeLayerCanvases(image.naturalWidth, image.naturalHeight);
+        await loadPaintLayer(nextPaintDataUrl);
+        await loadImageEraseLayer(nextImageEraseMaskDataUrl);
+      } else if (shouldUpdateZoom) {
+        latestZoomFactor = nextZoomFactor;
+        fitCanvas();
+      } else if (!sameRoundedBox(cropBox, nextCropBox)) {
+        cropBox = normalizeCropBox(nextCropBox);
+      }
+
+      if (!shouldReloadImage && nextPaintDataUrl !== latestPaintDataUrl) {
+        await loadPaintLayer(nextPaintDataUrl);
+      }
+      if (
+        !shouldReloadImage
+        && nextImageEraseMaskDataUrl !== latestImageEraseMaskDataUrl
+      ) {
+        await loadImageEraseLayer(nextImageEraseMaskDataUrl);
+      }
+
+      renderCanvas();
+      Streamlit.setFrameHeight(524);
+    }
+
+    window.addEventListener("resize", () => {
+      if (!image) return;
+      fitCanvas();
+      renderCanvas();
+    });
+
+    window.addEventListener("message", (event) => {
+      if (event.data.type !== "streamlit:render") return;
+      render(event.data.args || {});
+    });
+
+    Streamlit.setComponentReady();
+    Streamlit.setFrameHeight(524);
+  </script>
+</body>
+</html>
